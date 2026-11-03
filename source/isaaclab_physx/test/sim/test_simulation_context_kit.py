@@ -60,6 +60,13 @@ def test_reset_without_rigid_bodies_skips_rigid_body_view(monkeypatch):
 
     assert requested_patterns == []
     assert sim.physics_manager.get_scene_data_backend().get_rigid_body_view() is None
+    assert sim.physics_manager.get_simulation_time() == 0.0
+    sim.step(render=False)
+    assert sim.physics_manager.get_simulation_time() == pytest.approx(sim.get_physics_dt())
+    sim.reset(soft=True)
+    assert sim.physics_manager.get_simulation_time() == pytest.approx(sim.get_physics_dt())
+    sim.step(render=False)
+    assert sim.physics_manager.get_simulation_time() == pytest.approx(2 * sim.get_physics_dt())
 
 
 @pytest.mark.isaacsim_ci

@@ -212,10 +212,9 @@ class Ros2Bridge:
 
     def publish(self) -> None:
         """Publish measured joints, world transforms and the actual simulation clock."""
-        sim = self._env.sim
-        # A backend-owned step integrates the whole control decimation interval.
-        ticks_per_step = self._env.cfg.decimation if sim.physics_manager.handles_decimation() else 1
-        elapsed = sim.get_physics_step_count() * sim.get_physics_dt() * ticks_per_step
+        # Backend time advances only after integration and already includes decimation.
+        # SimulationContext's step counter also counts paused/stopped attempts.
+        elapsed = self._env.sim.physics_manager.get_simulation_time()
         nanoseconds = round(elapsed * 1_000_000_000)
         sec, nanosec = divmod(nanoseconds, 1_000_000_000)
         for stamp in (self._clock_msg.clock, self._state_msg.header.stamp):

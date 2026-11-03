@@ -567,6 +567,7 @@ class PhysxManager(PhysicsManager):
         physx_sim = omni.physx.get_physx_simulation_interface()
         physx_sim.simulate(sim.cfg.dt, 0.0)
         physx_sim.fetch_results()
+        PhysicsManager._sim_time += sim.cfg.dt
         cls.kinematics_dirty = False
         cls.invalidate_transforms()
         cls._scene_data_backend.geometry_timestamp += 1

@@ -130,12 +130,14 @@ def bridge_model(monkeypatch):
         num_envs=1,
         scene={"robot": asset},
         action_manager=SimpleNamespace(action=torch.zeros(1, 3), active_terms=list(terms), get_term=terms.__getitem__),
-        sim=SimpleNamespace(steps=0),
+        sim=SimpleNamespace(steps=0, time=0.0),
     )
     env.unwrapped = env
     env.sim.get_physics_step_count = lambda: env.sim.steps
     env.sim.get_physics_dt = lambda: 0.0005
-    env.sim.physics_manager = SimpleNamespace(handles_decimation=lambda: False)
+    env.sim.physics_manager = SimpleNamespace(
+        handles_decimation=lambda: False, get_simulation_time=lambda: env.sim.time
+    )
     return SimpleNamespace(env=env, asset=asset, terms=terms)
 
 
@@ -208,13 +210,14 @@ def test_position_commands_accept_and_ignore_valid_feedforward_arrays(bridge_env
 
 
 @pytest.mark.parametrize("backend_owns_decimation", [False, True])
-def test_publish_measured_effort_tf_and_sim_clock_across_episode_reset(bridge_env, backend_owns_decimation):
+def test_publish_clock_tracks_integrated_time_across_pause_stop_resume_and_reset(bridge_env, backend_owns_decimation):
     bridge_env.env.cfg.ros2_bridge.frame_prefix = "sim/"
     bridge = Ros2Bridge(bridge_env.env)
     try:
         # Backend-owned decimation can integrate several physics ticks per sim.step().
         bridge_env.env.sim.physics_manager.handles_decimation = lambda: backend_owns_decimation
         bridge_env.env.sim.steps = 6173 if backend_owns_decimation else 24692
+        bridge_env.env.sim.time = 12.346
         bridge.publish()
         state = bridge_env.node.published["/joint_states"][-1]
         assert state.name == ["b", "c", "a"]
@@ -228,9 +231,29 @@ def test_publish_measured_effort_tf_and_sim_clock_across_episode_reset(bridge_en
         assert vars(transform.transform.translation) == dict(x=4.0, y=5.0, z=6.0)
         assert vars(transform.transform.rotation) == pytest.approx(dict(x=0.5, y=0.1, z=0.2, w=0.3))
         assert vars(transform.header.stamp) == vars(state.header.stamp) == vars(clock)
+        # Paused and stopped headless loops may attempt steps without integrating.
+        # Neither these attempts nor repeated publication may advance any timestamp.
+        for _timeline_state in ("paused", "stopped"):
+            bridge_env.env.sim.steps += 3
+            bridge.publish()
+            clock = bridge_env.node.published["/clock"][-1].clock
+            state = bridge_env.node.published["/joint_states"][-1]
+            transform = bridge_env.node.published["/tf"][-1].transforms[0]
+            assert (clock.sec, clock.nanosec) == (12, 346000000)
+            assert vars(transform.header.stamp) == vars(state.header.stamp) == vars(clock)
+        # Resume one integration: backend-owned decimation spans four physics ticks.
+        bridge_env.env.sim.steps += 1
+        bridge_env.env.sim.time = 12.348 if backend_owns_decimation else 12.3465
+        bridge.publish()
+        clock = bridge_env.node.published["/clock"][-1].clock
+        assert (clock.sec, clock.nanosec) == (12, 348000000 if backend_owns_decimation else 346500000)
         bridge_env.env.episode_length_buf = torch.zeros(1)
         bridge_env.asset.data.joint_pos.torch.zero_()
+        bridge.publish()
+        clock = bridge_env.node.published["/clock"][-1].clock
+        assert (clock.sec, clock.nanosec) == (12, 348000000 if backend_owns_decimation else 346500000)
         bridge_env.env.sim.steps = 6200 if backend_owns_decimation else 24800
+        bridge_env.env.sim.time = 12.4
         bridge.publish()
         clock = bridge_env.node.published["/clock"][-1].clock
         assert (clock.sec, clock.nanosec) == (12, 400000000)
@@ -285,6 +308,7 @@ def test_ros2_real_private_context_transport(bridge_model):
     bridge_model.env.cfg.ros2_bridge.joint_state_topic = prefix + "/state"
     bridge_model.env.cfg.ros2_bridge.joint_command_topic = prefix + "/command"
     bridge_model.env.sim.steps = 250
+    bridge_model.env.sim.time = 0.125
     context = Context()
     rclpy.init(context=context)
     peer = rclpy.create_node("isaaclab_bridge_test_peer", context=context)

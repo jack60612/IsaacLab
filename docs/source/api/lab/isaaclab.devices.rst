@@ -252,10 +252,11 @@ to ``frame_prefix + body_name`` (the prefix defaults to empty), using world link
 Set ``frame_prefix="sim/"`` when a robot state publisher already owns the URDF
 frame tree, avoiding multiple parents for the same TF child frame.
 The ``wp.transformf`` Torch view already stores quaternion components in ROS-compatible
-xyzw order. All messages share the monotonic simulation step count times physics dt,
-independent of episode resets. When the backend's ``handles_decimation()`` is true,
-each counted step spans ``env.cfg.decimation`` physics ticks; the clock includes this factor.
-This clock contract assumes fixed physics dt and decimation ownership for the run.
+xyzw order. All messages share the backend's integrated simulation time from
+``physics_manager.get_simulation_time()``, independent of episode resets.
+Paused or stopped step attempts that do not integrate physics leave the timestamps
+unchanged. Backend-owned decimation is already included in this time; the bridge
+does not multiply it again or use wall-clock time.
 Commands are processed just before ``env.step`` and state is published afterward,
 as well as once after the initial reset. The bridge owns a private ROS context and
 a single-threaded executor bound to that context; both close before the environment.
