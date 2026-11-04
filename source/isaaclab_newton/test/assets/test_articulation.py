@@ -1401,8 +1401,12 @@ def test_write_data_to_sim_writes_joint_targets_in_backend_order(
     # Distinct per-joint targets away from the defaults, so a skipped or unpermuted write is visible.
     target = articulation.data.default_joint_pos.torch.clone()
     target += 0.01 * torch.arange(1, articulation.num_joints + 1, device=device)
-    articulation.set_joint_position_target_index(target=target)
-    articulation.write_data_to_sim()
+    with patch.object(SimulationManager, "add_model_change", wraps=SimulationManager.add_model_change) as changed:
+        for _ in range(3):
+            target += 0.01
+            articulation.set_joint_position_target_index(target=target)
+            articulation.write_data_to_sim()
+        changed.assert_not_called()
 
     source = (
         articulation.actuators.target_command.position.torch
@@ -1418,6 +1422,54 @@ def test_write_data_to_sim_writes_joint_targets_in_backend_order(
     expected_backend_target = torch.empty_like(source)
     expected_backend_target[:, user_to_backend] = source
     torch.testing.assert_close(wp.to_torch(articulation.data._sim_bind_joint_position_target), expected_backend_target)
+
+
+@pytest.mark.parametrize("selector_kind", ["index", "mask"])
+@pytest.mark.parametrize("num_articulations", [3])
+@pytest.mark.parametrize("device", ["cpu"])
+@pytest.mark.parametrize("gravity_enabled", [False])
+@pytest.mark.parametrize("articulation_type", ["anymal"])
+def test_effort_limit_writers_use_narrow_model_notification(
+    sim, num_articulations, device, gravity_enabled, articulation_type, selector_kind
+):
+    """Effort bounds remain model properties, unlike control targets; other parameters stay broad."""
+    articulation_cfg = generate_articulation_cfg(articulation_type=articulation_type)
+    articulation, _ = generate_articulation(articulation_cfg, num_articulations, device=sim.device)
+    replicate(sim.get_clone_plan())
+    sim.reset()
+    joint_ids = [0, 2]
+    env_ids = [1]
+    original = articulation.data.joint_effort_limits.torch.clone()
+    expected = original.clone()
+    with patch.object(SimulationManager, "add_model_change", wraps=SimulationManager.add_model_change) as changed:
+        for iteration in range(3):
+            values = torch.tensor([[1.0 + iteration, 2.0 + iteration]], device=device)
+            expected[1, joint_ids] = values[0]
+            if selector_kind == "index":
+                articulation.write_joint_effort_limit_to_sim_index(limits=values, joint_ids=joint_ids, env_ids=env_ids)
+            else:
+                env_mask = wp.array([False, True, False], dtype=wp.bool, device=device)
+                joint_mask = wp.array(
+                    [index in joint_ids for index in range(articulation.num_joints)], dtype=wp.bool, device=device
+                )
+                articulation.write_joint_effort_limit_to_sim_mask(
+                    limits=expected, joint_mask=joint_mask, env_mask=env_mask
+                )
+            changed.assert_called_with(ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES)
+            torch.testing.assert_close(articulation.data.joint_effort_limits.torch, expected)
+        assert changed.call_count == 3
+
+        # A genuine model gain or position-limit write must still request the full DOF update.
+        for writer, kwargs in (
+            (articulation.write_joint_stiffness_to_sim_index, {"stiffness": 10.0}),
+            (articulation.write_joint_damping_to_sim_index, {"damping": 2.0}),
+            (
+                articulation.write_joint_position_limit_to_sim_index,
+                {"limits": articulation.data.joint_pos_limits.torch.clone()},
+            ),
+        ):
+            writer(**kwargs)
+            changed.assert_called_with(ModelFlags.JOINT_DOF_PROPERTIES)
 
 
 @pytest.mark.isaacsim_ci
