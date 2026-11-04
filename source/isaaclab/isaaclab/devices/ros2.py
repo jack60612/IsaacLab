@@ -129,14 +129,26 @@ class Ros2Bridge:
         if set(self._command_indices) != set(self.cfg.joint_names):
             raise ValueError("Action terms must control every configured bridge joint exactly once.")
         positions = _tensor(self._asset.data.joint_pos)
+        # Callbacks mutate CPU targets only. A blocking copy after the ready drain
+        # keeps this reusable staging memory safe to change at the next exchange.
+        self._command_buffer = torch.empty_like(self._actions, device="cpu")
+        initial_positions = positions[0].cpu()
         for name, index in self._command_indices.items():
-            self._actions[0, index] = positions[0, joint_lookup[name]]
-        if not bool(torch.isfinite(self._actions).all()):
+            self._command_buffer[0, index] = initial_positions[joint_lookup[name]]
+        if not bool(torch.isfinite(self._command_buffer).all()):
             raise ValueError("Initial bridge joint positions must be finite.")
+        self._actions.copy_(self._command_buffer)
+        self._commands_dirty = False
         self._joint_ids = torch.tensor(joint_ids, device=positions.device, dtype=torch.long)
-        self._state_buffer = torch.empty((3, len(joint_ids)), dtype=positions.dtype, device="cpu")
-        self._gather_buffer = torch.empty((3, len(joint_ids)), dtype=positions.dtype, device=positions.device)
-        self._pose_buffer = torch.empty((len(self._body_ids), 7), dtype=positions.dtype, device="cpu")
+        self._body_indices = torch.tensor(self._body_ids, device=positions.device, dtype=torch.long)
+        joint_size = 3 * len(joint_ids)
+        snapshot_size = joint_size + 7 * len(self._body_ids)
+        self._gather_buffer = torch.empty(snapshot_size, dtype=positions.dtype, device=positions.device)
+        self._snapshot_buffer = torch.empty(snapshot_size, dtype=positions.dtype, device="cpu")
+        self._joint_gather = self._gather_buffer[:joint_size].view(3, len(joint_ids))
+        self._pose_gather = self._gather_buffer[joint_size:].view(len(self._body_ids), 7)
+        self._state_buffer = self._snapshot_buffer[:joint_size].view(3, len(joint_ids))
+        self._pose_buffer = self._snapshot_buffer[joint_size:].view(len(self._body_ids), 7)
         self._closed = False
 
         # Keep the optional dependency entirely outside ordinary zero-agent use.
@@ -213,7 +225,8 @@ class Ros2Bridge:
             self._node.get_logger().warning("Rejected malformed ROS joint-position command.")
             return
         for name, value in zip(names, values):
-            self._actions[0, self._command_indices[name]] = value
+            self._command_buffer[0, self._command_indices[name]] = value
+        self._commands_dirty = True
 
     def advance(self) -> torch.Tensor:
         """Process commands only when an exchange is due; otherwise return held targets."""
@@ -248,6 +261,9 @@ class Ros2Bridge:
             handler()
             handler.result()  # Propagate callback failures, as SingleThreadedExecutor does.
             dispatched = True
+        if self._commands_dirty:
+            self._actions.copy_(self._command_buffer)
+            self._commands_dirty = False
         return self._actions
 
     def publish(self) -> None:
@@ -268,16 +284,16 @@ class Ros2Bridge:
         self._state_msg.header.frame_id = self.cfg.world_frame
         data = self._asset.data
         for index, field in enumerate(("joint_pos", "joint_vel", "applied_torque")):
-            torch.index_select(_tensor(getattr(data, field))[0], 0, self._joint_ids, out=self._gather_buffer[index])
-        self._state_buffer.copy_(self._gather_buffer)
+            torch.index_select(_tensor(getattr(data, field))[0], 0, self._joint_ids, out=self._joint_gather[index])
+        if self._body_ids:
+            torch.index_select(_tensor(data.body_link_pose_w)[0], 0, self._body_indices, out=self._pose_gather)
+        # One contiguous device-to-host snapshot contains every published value.
+        self._snapshot_buffer.copy_(self._gather_buffer)
         for field, row in zip(("position", "velocity", "effort"), self._state_buffer):
             values = getattr(self._state_msg, field)
             for index in range(len(values)):
                 values[index] = float(row[index])
         if self._body_ids:
-            poses = _tensor(data.body_link_pose_w)
-            for index, body_id in enumerate(self._body_ids):
-                self._pose_buffer[index].copy_(poses[0, body_id])
             for transform, pose in zip(self._tf_msg.transforms, self._pose_buffer):
                 transform.header.stamp.sec = sec
                 transform.header.stamp.nanosec = nanosec

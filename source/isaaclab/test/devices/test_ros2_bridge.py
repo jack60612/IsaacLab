@@ -139,9 +139,19 @@ def bridge_model(monkeypatch):
         joint_pos=SimpleNamespace(torch=torch.tensor([[1.0, 2.0, 3.0]])),
         joint_vel=torch.tensor([[0.1, 0.2, 0.3]]),
         applied_torque=SimpleNamespace(torch=torch.tensor([[10.0, 20.0, 30.0]])),
-        body_link_pose_w=SimpleNamespace(torch=torch.tensor([[[4.0, 5.0, 6.0, 0.5, 0.1, 0.2, 0.3]]])),
+        body_link_pose_w=SimpleNamespace(
+            torch=torch.tensor(
+                [
+                    [
+                        [100.0, 101.0, 102.0, 0.0, 0.0, 0.0, 1.0],
+                        [4.0, 5.0, 6.0, 0.5, 0.1, 0.2, 0.3],
+                        [200.0, 201.0, 202.0, 0.0, 0.0, 0.0, 1.0],
+                    ]
+                ]
+            )
+        ),
     )
-    asset = SimpleNamespace(joint_names=["a", "b", "c"], body_names=["tool"], num_joints=3, data=data)
+    asset = SimpleNamespace(joint_names=["a", "b", "c"], body_names=["plant", "tool", "apple"], num_joints=3, data=data)
     terms = {
         "mechanics": SimpleNamespace(action_dim=0),
         "arm": JointPositionAction(asset, [2, 0]),
@@ -324,7 +334,7 @@ def test_exchange_cadence_holds_commands_and_publishes_only_on_anchored_grid(bri
             assert actions[0, 1].item() == target
             bridge_env.env.sim.time = (step + 1) * 0.0005
             bridge.publish()
-            assert len(gathers) - before_gathers == (3 if due else 0)
+            assert len(gathers) - before_gathers == (4 if due else 0)
             assert bridge_env.node.spins == 3 * len(exchanges)
             assert len(bridge_env.node.published["/clock"]) == len(exchanges) + 1
             if due:
@@ -435,6 +445,118 @@ def test_exchange_drains_arm_gripper_and_clock_callbacks_at_each_boundary(bridge
         assert bridge_env.node.spins == 33  # Five callback/timeout pairs plus one empty pass each.
         assert len(bridge_env.node.warnings) == 3
         assert len(bridge_env.node.published["/clock"]) == 4
+    finally:
+        bridge.close()
+
+
+@pytest.fixture
+def transfer_copies(monkeypatch):
+    """Observe explicit copy boundaries even when both devices are CPU."""
+    copies = []
+    copy_tensor = torch.Tensor.copy_
+
+    def record(destination, source, *args, **kwargs):
+        copies.append((destination, source))
+        return copy_tensor(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", record)
+    return copies
+
+
+def test_partial_messages_stage_one_command_copy_after_complete_ready_drain(bridge_env, transfer_copies):
+    bridge = Ros2Bridge(bridge_env.env)
+    transfer_copies.clear()  # Initialization seeds targets once from reset state.
+    try:
+        bridge_env.node.pending.extend(
+            [
+                _command(["a", "c"], [7.0, 9.0]),
+                _command(["b"], [8.0]),
+                _command(["unknown"], [99.0]),
+                _command(["a"], [10.0]),
+            ]
+        )
+
+        def observe_staging():
+            assert not transfer_copies
+            torch.testing.assert_close(bridge._actions, torch.tensor([[3.0, 1.0, 2.0]]))
+            torch.testing.assert_close(bridge._command_buffer, torch.tensor([[9.0, 10.0, 8.0]]))
+
+        bridge_env.node.pending.append(observe_staging)
+        actions = bridge.advance()
+        assert not bridge_env.node.pending
+        assert len(transfer_copies) == 1
+        assert transfer_copies[0][0] is actions
+        assert transfer_copies[0][1] is bridge._command_buffer
+        torch.testing.assert_close(actions, torch.tensor([[9.0, 10.0, 8.0]]))
+        transfer_copies.clear()
+        bridge.advance()  # No commands means no target transfer.
+        bridge_env.node.pending.append(_command(["unknown"], [99.0]))
+        bridge.advance()  # Rejected commands do not dirty staging.
+        assert not transfer_copies
+    finally:
+        bridge.close()
+
+
+def test_nonexchange_steps_do_not_transfer_commands_or_snapshot(bridge_env, transfer_copies, monkeypatch):
+    bridge_env.env.cfg.ros2_bridge.exchange_period_s = 1.0 / 150.0
+    bridge = Ros2Bridge(bridge_env.env)
+    try:
+        bridge.publish()
+        transfer_copies.clear()
+        bridge_env.node.pending.append(_command(["a"], [7.0]))
+
+        def unexpected_gather(*args, **kwargs):
+            pytest.fail("Nonexchange step gathered state.")
+
+        monkeypatch.setattr(torch, "index_select", unexpected_gather)
+        for step in range(14):
+            bridge_env.env.sim.time = step * 0.0005
+            assert bridge.advance() is bridge._actions
+            bridge.publish()
+        assert not transfer_copies
+        assert bridge_env.node.spins == 0
+        assert len(bridge_env.node.pending) == 1
+        assert len(bridge_env.node.published["/clock"]) == 1
+    finally:
+        bridge.close()
+
+
+@pytest.mark.parametrize("bodies", [(), ("tool",), ("apple", "tool")])
+def test_joint_state_and_only_configured_tf_share_one_reused_snapshot(bridge_env, transfer_copies, bodies):
+    bridge_env.env.cfg.ros2_bridge.body_names = bodies
+    bridge = Ros2Bridge(bridge_env.env)
+    transfer_copies.clear()
+    try:
+        gather = bridge._gather_buffer
+        snapshot = bridge._snapshot_buffer
+        command = bridge._command_buffer
+        assert gather.numel() == snapshot.numel() == 9 + 7 * len(bodies)
+        for view in (bridge._state_buffer, bridge._pose_buffer):
+            assert view.untyped_storage().data_ptr() == snapshot.untyped_storage().data_ptr()
+        for view in (bridge._joint_gather, bridge._pose_gather):
+            assert view.untyped_storage().data_ptr() == gather.untyped_storage().data_ptr()
+        for iteration in range(2):
+            bridge_env.asset.data.joint_pos.torch[0, 1] = 2.0 + iteration
+            bridge.publish()
+            assert len(transfer_copies) == iteration + 1
+            assert transfer_copies[-1][0] is snapshot
+            assert transfer_copies[-1][1] is gather
+            assert bridge._gather_buffer is gather
+            assert bridge._snapshot_buffer is snapshot
+            assert bridge._command_buffer is command
+            state = bridge_env.node.published["/joint_states"][-1]
+            assert state.position == [2.0 + iteration, 3.0, 1.0]
+            assert state.velocity == pytest.approx([0.2, 0.3, 0.1])
+            assert state.effort == [20.0, 30.0, 10.0]
+            if bodies:
+                transforms = bridge_env.node.published["/tf"][-1].transforms
+                assert [transform.child_frame_id for transform in transforms] == list(bodies)
+                assert all(transform.child_frame_id != "plant" for transform in transforms)
+                assert [transform.transform.translation.x for transform in transforms] == [
+                    200.0 if name == "apple" else 4.0 for name in bodies
+                ]
+            else:
+                assert not bridge_env.node.published["/tf"]
     finally:
         bridge.close()
 

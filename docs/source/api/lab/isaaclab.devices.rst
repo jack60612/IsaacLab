@@ -253,6 +253,9 @@ on ``/tf`` for configured bodies. Transforms map ``world_frame`` (default ``worl
 to ``frame_prefix + body_name`` (the prefix defaults to empty), using world link poses.
 Set ``frame_prefix="sim/"`` when a robot state publisher already owns the URDF
 frame tree, avoiding multiple parents for the same TF child frame.
+``body_names`` is an exact, ordered subset of the selected articulation's bodies;
+unconfigured bodies and other scene assets (including plants and apples) are never
+gathered or published. An empty tuple disables body-pose gathering and TF publication.
 The ``wp.transformf`` Torch view already stores quaternion components in ROS-compatible
 xyzw order. All messages share the backend's integrated simulation time from
 ``physics_manager.get_simulation_time()``, independent of episode resets.
@@ -268,6 +271,16 @@ published immediately; subsequent command processing occurs at the first pre-ste
 integrated-time sample meeting each deadline, followed by one post-step publication
 of joint state, TF and clock. Between exchanges, the same action tensor holds its
 targets, without polling ROS, gathering state or copying it to the CPU.
+Ready callbacks update a persistent CPU command staging buffer. After the complete
+ready drain (including Jazzy's productive-readiness-pass retry), one blocking copy
+updates the device action tensor if any valid command arrived. Multiple partial
+messages therefore share one transfer, with the last received value winning per
+joint; invalid-only or empty drains perform none. Blocking the copy ensures the
+staging buffer is safe to reuse on the next exchange.
+Publication gathers the configured joint positions, velocities, applied torques
+and body poses into one contiguous device buffer, then copies that entire snapshot
+to the CPU once for joint-state and TF serialization. Buffers and their joint/pose
+views are allocated once during construction, including on CPU-only environments.
 
 Deadlines are anchored to the initial publication time, not accumulated from the
 last exchange. For example, a period of ``1.0 / 150.0`` with 0.5 ms physics steps
