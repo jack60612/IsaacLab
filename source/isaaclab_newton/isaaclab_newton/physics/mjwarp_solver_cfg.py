@@ -29,7 +29,7 @@ class MJWarpSolverCfg(NewtonSolverCfg):
     solver_type: str = "mujoco_warp"
     """Solver type. Can be "mujoco_warp"."""
 
-    njmax: int = 300
+    njmax: int | None = 300
     """Number of constraints per environment (world)."""
 
     nconmax: int | None = None
