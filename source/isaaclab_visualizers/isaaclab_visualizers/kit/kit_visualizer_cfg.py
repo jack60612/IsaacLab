@@ -42,6 +42,26 @@ class KitBackendCfg(VisualizerBackendCfg):
     create_viewport: bool = False
     """If ``True``, create a new viewport window; if ``False``, use the active viewport window."""
 
+    enable_picking: bool = True
+    """Enable Shift+left-drag with supported Newton rigid-body solvers.
+
+    Requires the Isaac Sim fork's ``NewtonViewportInteraction`` adapter and
+    Newton's public ``newton.viewer.Picking`` API. Disabled in headless mode.
+    """
+
+    pick_stiffness: float = 50.0
+    """Picking spring stiffness [1/s²]."""
+
+    pick_damping: float = 5.0
+    """Picking damping [1/s]."""
+
+    pick_max_acceleration: float = 5.0
+    """Finite nonnegative linear/rotational acceleration bound [g].
+
+    Matches Newton Picking's default; increase explicitly for stronger bounded
+    interaction. The Newton picker validates and enforces this bound.
+    """
+
     dock_position: str = "SAME"
     """Dock position for the streaming image panel and any new viewport window.
 
