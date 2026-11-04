@@ -92,7 +92,15 @@ def run(argv: list[str] | None = None, *, policy: PolicyName) -> None:
         logger.info(f"Gym observation space: {env.observation_space}")
         logger.info(f"Gym action space: {env.action_space}")
         env.reset()
-        if policy == "zero":
+        bridge = None
+        if policy == "zero" and args_cli.ros2:
+            from isaaclab.devices.ros2 import Ros2Bridge
+
+            bridge = Ros2Bridge(env)
+            cleanup.callback(bridge.close)
+            bridge.publish()
+            action_policy = bridge.advance
+        elif policy == "zero":
             action_policy = create_zero_action_policy(env)
         else:
             action_policy = create_random_action_policy(env)
@@ -110,6 +118,8 @@ def run(argv: list[str] | None = None, *, policy: PolicyName) -> None:
             step += 1
             with torch.inference_mode():
                 env.step(action_policy())
+                if bridge is not None:
+                    bridge.publish()
 
 
 def create_zero_action_policy(env: gym.Env) -> Callable[[], Any]:
@@ -261,6 +271,8 @@ def _parse_args(argv: list[str] | None, policy: PolicyName) -> argparse.Namespac
     parser.add_argument(
         "--max_steps", type=int, default=None, help="Number of environment steps to run. Runs unbounded when omitted."
     )
+    if policy == "zero":
+        parser.add_argument("--ros2", action="store_true", help="Use the task's optional ROS 2 joint-position bridge.")
     add_video_args(parser, action=f"the {policy} agent run")
     add_launcher_args(parser)
     # let task configs select the simulation device
