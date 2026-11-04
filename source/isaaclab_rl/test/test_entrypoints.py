@@ -941,3 +941,66 @@ def test_rsl_rl_checkpoint_preserves_selected_optimizer_state(
         assert not destination.alg.optimizer.state
     else:
         torch.testing.assert_close(destination_state["optimizer_state_dict"], source_state["optimizer_state_dict"])
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_zero_agent_ros2_lockstep_lifecycle(monkeypatch, interrupt):
+    """ROS observes reset state, supplies each step and closes before the environment."""
+    from isaaclab.devices import ros2
+
+    events = []
+    cfg = SimpleNamespace(
+        scene=SimpleNamespace(num_envs=1),
+        sim=SimpleNamespace(device="cpu", use_fabric=True),
+        validate=lambda: None,
+    )
+    actions = torch.tensor([[0.5]])
+
+    def step(value):
+        assert value is actions
+        events.append("step")
+        if interrupt:
+            raise KeyboardInterrupt
+
+    env = SimpleNamespace(
+        observation_space="observations",
+        action_space="actions",
+        unwrapped=SimpleNamespace(sim=SimpleNamespace(is_running=lambda: True)),
+        reset=lambda: events.append("reset"),
+        step=step,
+        close=lambda: events.append("env.close"),
+    )
+
+    class Bridge:
+        def __init__(self, environment):
+            assert environment is env
+            events.append("bridge.init")
+
+        def advance(self):
+            events.append("advance")
+            return actions
+
+        def publish(self):
+            events.append("publish")
+
+        def close(self):
+            events.append("bridge.close")
+
+    monkeypatch.setattr(ros2, "Ros2Bridge", Bridge)
+    monkeypatch.setattr(
+        simple_agents,
+        "_parse_args",
+        lambda argv, policy: SimpleNamespace(max_steps=1, task="Example", device=None, num_envs=None, ros2=True),
+    )
+    monkeypatch.setattr(simple_agents, "resolve_task_config", lambda task, agent: (cfg, None))
+    monkeypatch.setattr(simple_agents, "launch_simulation", lambda cfg, args: contextlib.nullcontext())
+    monkeypatch.setattr(simple_agents.gym, "make", lambda task, cfg: env)
+    if interrupt:
+        with pytest.raises(KeyboardInterrupt):
+            simple_agents.run([], policy="zero")
+    else:
+        simple_agents.run([], policy="zero")
+    expected = ["reset", "bridge.init", "publish", "advance", "step"]
+    if not interrupt:
+        expected.append("publish")
+    assert events == expected + ["bridge.close", "env.close"]
