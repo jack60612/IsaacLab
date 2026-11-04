@@ -18,24 +18,35 @@ from isaaclab_visualizers.kit.kit_visualization_markers import KitVisualizationM
 from isaaclab_visualizers.kit.kit_visualizer import KitVisualizer
 from isaaclab_visualizers.kit.kit_visualizer_cfg import KitBackendCfg
 
-import omni
 from pxr import Sdf, Usd, UsdGeom, UsdLux
 
 from isaaclab.utils.renderers import ISAAC_RTX_SHOW_ALL_PARTITIONS_BY_DEFAULT_SETTING
 from isaaclab.visualizers import VisualizerCfg
 
+pytestmark = [pytest.mark.unit, pytest.mark.kitless]
+
+
+@pytest.fixture(autouse=True)
+def kit_namespace(monkeypatch):
+    """Replace the UI namespace as well as its APIs for Kit-free CPU coverage."""
+    omni = ModuleType("omni")
+    monkeypatch.setitem(sys.modules, "omni", omni)
+    return omni
+
 
 @pytest.fixture(autouse=True)
 def reset_kit_timeline_control_state():
     KitVisualizer._timeline_auto_update = None
+    KitVisualizer._timeline_play_simulations = None
     KitVisualizer._timeline_control_owner_count = 0
     yield
     KitVisualizer._timeline_auto_update = None
+    KitVisualizer._timeline_play_simulations = None
     KitVisualizer._timeline_control_owner_count = 0
 
 
 @pytest.fixture
-def kit_app(monkeypatch):
+def kit_app(monkeypatch, kit_namespace):
     app = MagicMock()
     app.is_running.return_value = True
     app_module = ModuleType("omni.kit.app")
@@ -44,17 +55,17 @@ def kit_app(monkeypatch):
     kit_module.app = app_module
     monkeypatch.setitem(sys.modules, "omni.kit", kit_module)
     monkeypatch.setitem(sys.modules, "omni.kit.app", app_module)
-    monkeypatch.setattr(omni, "kit", kit_module, raising=False)
+    monkeypatch.setattr(kit_namespace, "kit", kit_module, raising=False)
     return app
 
 
 @pytest.fixture
-def kit_timeline(monkeypatch):
+def kit_timeline(monkeypatch, kit_namespace):
     timeline = MagicMock()
     timeline_module = ModuleType("omni.timeline")
     timeline_module.get_timeline_interface = lambda: timeline
     monkeypatch.setitem(sys.modules, "omni.timeline", timeline_module)
-    monkeypatch.setattr(omni, "timeline", timeline_module, raising=False)
+    monkeypatch.setattr(kit_namespace, "timeline", timeline_module, raising=False)
     return timeline
 
 
@@ -134,7 +145,14 @@ def test_app_update_restores_signal_handlers(monkeypatch, kit_app):
 def test_timeline_controls_share_ownership_and_restore_after_last_stop(monkeypatch, kit_app, kit_timeline):
     kit_timeline.is_auto_updating.return_value = True
     settings = MagicMock()
-    settings.get.return_value = True
+    values = {"/app/player/playSimulations": True}
+    settings.get.side_effect = values.get
+    settings.set.side_effect = values.__setitem__
+
+    def assert_native_physics_disabled():
+        assert values["/app/player/playSimulations"] is False
+
+    kit_timeline.play.side_effect = assert_native_physics_disabled
     monkeypatch.setattr(kit_visualizer_module, "get_settings_manager", lambda: settings)
     visualizers = [
         KitVisualizer(VisualizerCfg(backend=KitBackendCfg())),
@@ -159,17 +177,20 @@ def test_timeline_controls_share_ownership_and_restore_after_last_stop(monkeypat
 
     assert kit_timeline.is_auto_updating.call_count == 1
     assert [call.args for call in kit_timeline.set_auto_update.call_args_list] == [(False,), (False,)]
+    assert values["/app/player/playSimulations"] is False
 
     visualizers[0].stop()
 
     kit_timeline.stop.assert_not_called()
     assert [call.args for call in kit_timeline.set_auto_update.call_args_list] == [(False,), (False,)]
+    assert values["/app/player/playSimulations"] is False
 
     visualizers[1].stop()
 
     kit_timeline.stop.assert_called_once_with()
     assert [call.args for call in kit_timeline.set_auto_update.call_args_list] == [(False,), (False,), (True,)]
     assert kit_app.update.call_count == 4
+    assert values["/app/player/playSimulations"] is True
 
 
 def test_close_cleans_resources_when_timeline_stop_is_interrupted(monkeypatch, kit_timeline):
@@ -178,6 +199,9 @@ def test_close_cleans_resources_when_timeline_stop_is_interrupted(monkeypatch, k
     visualizer._controls_kit_timeline = True
     visualizer._owns_kit_timeline = True
     KitVisualizer._timeline_auto_update = True
+    KitVisualizer._timeline_play_simulations = True
+    settings = MagicMock()
+    monkeypatch.setattr(kit_visualizer_module, "get_settings_manager", lambda: settings)
     KitVisualizer._timeline_control_owner_count = 1
     teardown_label = MagicMock()
     restore_visibility = MagicMock()
@@ -192,6 +216,7 @@ def test_close_cleans_resources_when_timeline_stop_is_interrupted(monkeypatch, k
 
     kit_timeline.stop.assert_called_once_with()
     kit_timeline.set_auto_update.assert_called_once_with(True)
+    settings.set.assert_called_once_with("/app/player/playSimulations", True)
     teardown_label.assert_called_once_with()
     restore_visibility.assert_called_once_with()
     annotator.detach.assert_called_once_with()
@@ -209,7 +234,7 @@ def test_close_cleans_resources_when_timeline_stop_is_interrupted(monkeypatch, k
 def test_timeline_controls_only_non_physx_backends(monkeypatch, physics_backend, controls_timeline, caplog):
     """Timeline setup must survive unavailable optional window input."""
     monkeypatch.setitem(sys.modules, "omni.appwindow", None)
-    visualizer = KitVisualizer(VisualizerCfg(backend=KitBackendCfg()))
+    visualizer = KitVisualizer(VisualizerCfg(backend=KitBackendCfg(enable_picking=False)))
     sim = MagicMock(has_gui=True, stage=Usd.Stage.CreateInMemory(), device="cpu")
     sim.get_scene_data_provider.return_value.num_envs = 0
     fabric = sim.get_or_create_backend.return_value
@@ -232,6 +257,34 @@ def test_timeline_controls_only_non_physx_backends(monkeypatch, physics_backend,
     fabric.bind_transforms.assert_called_once_with(sim.get_scene_data_provider.return_value)
     assert visualizer.is_initialized and visualizer.key_event_source is None
     assert "Keyboard input is unavailable" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("visible", "partition", "expected"),
+    [(None, "env_1", [1]), ([0, 2], "env_2", [2]), ([0, 2], "env_1", []), ([0, 2], None, [0, 2])],
+)
+def test_newton_picking_masks_effective_viewport_partition(monkeypatch, visible, partition, expected):
+    """Hidden camera partitions cannot intercept an otherwise visible-world pick."""
+    import isaaclab_visualizers.kit.newton_picking as picking_module
+
+    stage = Usd.Stage.CreateInMemory()
+    camera = UsdGeom.Camera.Define(stage, "/Camera").GetPrim()
+    if partition is not None:
+        camera.CreateAttribute("omni:scenePartition", Sdf.ValueTypeNames.Token).Set(partition)
+    visualizer = KitVisualizer(VisualizerCfg(backend=KitBackendCfg()))
+    visualizer._controlled_camera_path = "/Camera"
+    visualizer._env_ids = visible
+    sim = MagicMock(stage=stage)
+    sim.get_scene_data_provider.return_value.num_envs = 3
+    sim.cfg.physics.solver_cfg.class_type.applies_body_forces.return_value = True
+    visualizer._sim = sim
+    monkeypatch.setattr(KitVisualizer, "physics_backend", property(lambda _: "newton"))
+    constructor = MagicMock()
+    monkeypatch.setattr(picking_module, "KitNewtonPicking", constructor)
+
+    visualizer._prepare_newton_picking()
+
+    assert constructor.call_args.args[3] == expected
 
 
 @pytest.mark.parametrize("color", [(0.1, 0.2, 0.3), None])

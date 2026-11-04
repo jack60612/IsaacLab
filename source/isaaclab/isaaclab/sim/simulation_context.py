@@ -547,7 +547,7 @@ class SimulationContext:
     @staticmethod
     def _requires_pre_capture_newton_init(cfg: Any) -> bool:
         """Return whether a config contributes Newton picking inputs to capture."""
-        return cfg.backend.visualizer_type == "newton_gl" and cfg.backend.enable_picking and not cfg.headless
+        return cfg.backend.visualizer_type in {"kit", "newton_gl"} and cfg.backend.enable_picking and not cfg.headless
 
     def reset(self, soft: bool = False) -> None:
         """Reset the simulation.
