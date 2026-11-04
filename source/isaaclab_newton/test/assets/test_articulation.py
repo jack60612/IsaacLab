@@ -36,6 +36,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import newton
 import numpy as np
@@ -1616,8 +1617,13 @@ def test_write_data_to_sim_writes_joint_targets_in_backend_order(scene: _Scene, 
     # Distinct per-joint targets away from the defaults, so a skipped or unpermuted write is visible.
     target = articulation.data.default_joint_pos.torch.clone()
     target += 0.01 * torch.arange(1, articulation.num_joints + 1, device=device)
-    articulation.set_joint_position_target_index(target=target)
-    articulation.write_data_to_sim()
+    manager = scene.sim.backend_manager
+    with patch.object(manager, "add_model_change", wraps=manager.add_model_change) as changed:
+        for _ in range(3):
+            target += 0.01
+            articulation.set_joint_position_target_index(target=target)
+            articulation.write_data_to_sim()
+        changed.assert_not_called()
 
     source = articulation.actuators.output_command.position.torch
     torch.testing.assert_close(source, target)
@@ -1630,6 +1636,54 @@ def test_write_data_to_sim_writes_joint_targets_in_backend_order(scene: _Scene, 
     expected_backend_target[:, user_to_backend] = source
     torch.testing.assert_close(wp.to_torch(articulation.data._sim_bind_joint_position_target), expected_backend_target)
     scene.rest(articulation)
+
+
+@pytest.mark.parametrize("selector_kind", ["index", "mask"])
+def test_effort_limit_writers_use_narrow_model_notification(scene: _Scene, selector_kind: str) -> None:
+    """Subset force bounds notify narrowly, while real gain and position-limit writes stay broad."""
+    articulation = scene.articulations["ordered"]
+    scene.rest(articulation)
+    manager = scene.sim.backend_manager
+    joint_ids = [0, 2]
+    original = articulation.data.joint_effort_limits.torch.clone()
+    stiffness = articulation.data.joint_stiffness.torch.clone()
+    damping = articulation.data.joint_damping.torch.clone()
+    position_limits = articulation.data.joint_pos_limits.torch.clone()
+    expected = original.clone()
+    try:
+        with patch.object(manager, "add_model_change", wraps=manager.add_model_change) as changed:
+            for iteration in range(3):
+                values = torch.tensor([[1.0 + iteration, 2.0 + iteration]], device=scene.device)
+                expected[1, joint_ids] = values[0]
+                if selector_kind == "index":
+                    articulation.write_joint_effort_limit_to_sim_index(limits=values, joint_ids=joint_ids, env_ids=[1])
+                else:
+                    env_mask = wp.array([False, True], dtype=wp.bool, device=scene.device)
+                    joint_mask = wp.array(
+                        [index in joint_ids for index in range(articulation.num_joints)],
+                        dtype=wp.bool,
+                        device=scene.device,
+                    )
+                    articulation.write_joint_effort_limit_to_sim_mask(
+                        limits=expected, joint_mask=joint_mask, env_mask=env_mask
+                    )
+                changed.assert_called_with(ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES)
+                torch.testing.assert_close(articulation.data.joint_effort_limits.torch, expected)
+            assert changed.call_count == 3
+
+            for writer, kwargs in (
+                (articulation.write_joint_stiffness_to_sim_index, {"stiffness": 10.0}),
+                (articulation.write_joint_damping_to_sim_index, {"damping": 2.0}),
+                (articulation.write_joint_position_limit_to_sim_index, {"limits": position_limits}),
+            ):
+                writer(**kwargs)
+                changed.assert_called_with(ModelFlags.JOINT_DOF_PROPERTIES)
+    finally:
+        articulation.write_joint_effort_limit_to_sim_index(limits=original)
+        articulation.write_joint_stiffness_to_sim_index(stiffness=stiffness)
+        articulation.write_joint_damping_to_sim_index(damping=damping)
+        articulation.write_joint_position_limit_to_sim_index(limits=position_limits)
+        scene.rest(articulation)
 
 
 @pytest.mark.parametrize("island", ["limits_implicit", "limits_explicit"], ids=["implicit", "explicit"])

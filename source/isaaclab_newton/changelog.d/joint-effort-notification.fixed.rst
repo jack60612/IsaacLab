@@ -1,0 +1,1 @@
+* Fixed Newton joint effort-limit writers to notify only force-bound changes, preserving native implicit PD while avoiding unnecessary MuJoCo reference-pose constant recomputation. Requires Newton's ``ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES``; other joint parameter writers retain full DOF notifications and control targets require no model notification.

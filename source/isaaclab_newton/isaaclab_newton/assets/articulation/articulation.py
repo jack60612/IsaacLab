@@ -1502,6 +1502,7 @@ class Articulation(BaseArticulation):
         value_name: str,
         user_buffer: wp.array2d(dtype=wp.float32),
         backend_buffer: wp.array2d(dtype=wp.float32),
+        model_flags: ModelFlags = ModelFlags.JOINT_DOF_PROPERTIES,
         joint_ids: Sequence[int] | torch.Tensor | wp.array | None = None,
         env_ids: Sequence[int] | torch.Tensor | wp.array | None = None,
     ) -> None:
@@ -1529,7 +1530,7 @@ class Articulation(BaseArticulation):
             device=self.device,
         )
 
-        self._backend_manager.add_model_change(ModelFlags.JOINT_DOF_PROPERTIES)
+        self._backend_manager.add_model_change(model_flags)
 
     def _write_joint_float_property_to_sim_mask(
         self,
@@ -1538,6 +1539,7 @@ class Articulation(BaseArticulation):
         value_name: str,
         user_buffer: wp.array2d(dtype=wp.float32),
         backend_buffer: wp.array2d(dtype=wp.float32),
+        model_flags: ModelFlags = ModelFlags.JOINT_DOF_PROPERTIES,
         joint_mask: wp.array | None = None,
         env_mask: wp.array | None = None,
     ) -> None:
@@ -1564,7 +1566,7 @@ class Articulation(BaseArticulation):
             device=self.device,
         )
 
-        self._backend_manager.add_model_change(ModelFlags.JOINT_DOF_PROPERTIES)
+        self._backend_manager.add_model_change(model_flags)
 
     def write_joint_stiffness_to_sim_index(
         self,
@@ -1915,6 +1917,8 @@ class Articulation(BaseArticulation):
 
         The effort limit is used to constrain the computed joint efforts in the physics engine. If the
         computed effort exceeds this limit, the physics engine will clip the effort to this value.
+        This is a model-property update, notified with ``ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES``.
+        Unlike joint gains or position limits, force bounds do not require reference-pose constant recomputation.
 
         .. note::
             This method expects partial data.
@@ -1933,6 +1937,7 @@ class Articulation(BaseArticulation):
             value_name="limits",
             user_buffer=self.data._joint_effort_limits_user,
             backend_buffer=self.data._sim_bind_joint_effort_limits_sim,
+            model_flags=ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES,
             joint_ids=joint_ids,
             env_ids=env_ids,
         )
@@ -1948,6 +1953,8 @@ class Articulation(BaseArticulation):
 
         The effort limit is used to constrain the computed joint efforts in the physics engine. If the
         computed effort exceeds this limit, the physics engine will clip the effort to this value.
+        This is a model-property update, notified with ``ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES``.
+        Unlike joint gains or position limits, force bounds do not require reference-pose constant recomputation.
 
         .. note::
             This method expects full data.
@@ -1966,6 +1973,7 @@ class Articulation(BaseArticulation):
             value_name="limits",
             user_buffer=self.data._joint_effort_limits_user,
             backend_buffer=self.data._sim_bind_joint_effort_limits_sim,
+            model_flags=ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES,
             joint_mask=joint_mask,
             env_mask=env_mask,
         )
