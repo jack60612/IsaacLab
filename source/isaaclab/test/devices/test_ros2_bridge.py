@@ -51,7 +51,7 @@ class JointPositionAction:
 @pytest.fixture
 def bridge_env(monkeypatch, bridge_model):
     """Provide transport doubles only; production code owns mapping and state conversion."""
-    node = SimpleNamespace(published={}, pending=[], warnings=[], destroyed=False)
+    node = SimpleNamespace(published={}, pending=[], warnings=[], destroyed=False, spins=0)
 
     def publisher(_kind, topic, _depth):
         node.published[topic] = []
@@ -68,19 +68,42 @@ def bridge_env(monkeypatch, bridge_model):
     context = SimpleNamespace(shutdown=False)
     context.try_shutdown = lambda: setattr(context, "shutdown", True)
 
+    class TimeoutException(Exception):
+        pass
+
+    class ReadyCallback:
+        def __call__(self):
+            message = node.pending.pop(0)
+            if callable(message):
+                message()
+            else:
+                node.callback(message)
+
+        def result(self):
+            return None
+
     class Executor:
         def __init__(self, *, context):
             assert context is bridge_context
             self.node = None
             self.stopped = False
+            self.yielded = False
 
         def add_node(self, value):
             self.node = value
 
-        def spin_once(self, *, timeout_sec):
+        def wait_for_ready_callbacks(self, *, timeout_sec):
             assert self.node is node and timeout_sec == 0.0
-            if node.pending:
-                node.callback(node.pending.pop(0))
+            node.spins += 1
+            # Match Jazzy's cached generator: timeout after a yielded readiness
+            # pass does not imply the subscription's message queue is empty.
+            if self.yielded:
+                self.yielded = False
+                raise TimeoutException
+            if not node.pending:
+                raise TimeoutException
+            self.yielded = True
+            return ReadyCallback(), None, node
 
         def shutdown(self):
             self.stopped = True
@@ -90,7 +113,7 @@ def bridge_env(monkeypatch, bridge_model):
     modules = {
         "rclpy": dict(init=lambda **kwargs: None, create_node=lambda *args, **kwargs: node),
         "rclpy.context": dict(Context=lambda: context),
-        "rclpy.executors": dict(SingleThreadedExecutor=Executor),
+        "rclpy.executors": dict(SingleThreadedExecutor=Executor, TimeoutException=TimeoutException),
         "rclpy.parameter": dict(Parameter=lambda name, *, value: SimpleNamespace(name=name, value=value)),
         "sensor_msgs.msg": dict(JointState=JointState),
         "geometry_msgs.msg": dict(TransformStamped=TransformStamped),
@@ -261,6 +284,161 @@ def test_publish_clock_tracks_integrated_time_across_pause_stop_resume_and_reset
         bridge.close()
 
 
+@pytest.mark.parametrize("period", [-1.0, float("nan"), float("inf"), -float("inf")])
+def test_invalid_exchange_period_fails_before_creating_ros_node(bridge_env, period):
+    bridge_env.env.cfg.ros2_bridge.exchange_period_s = period
+    with pytest.raises(ValueError, match="exchange_period_s"):
+        Ros2Bridge(bridge_env.env)
+    assert not bridge_env.node.published
+
+
+def test_exchange_cadence_holds_commands_and_publishes_only_on_anchored_grid(bridge_env, monkeypatch):
+    period = 1.0 / 150.0
+    bridge_env.env.cfg.ros2_bridge.exchange_period_s = period
+    bridge = Ros2Bridge(bridge_env.env)
+    gathers = []
+    index_select = torch.index_select
+
+    def gather(*args, **kwargs):
+        gathers.append(bridge_env.env.sim.time)
+        return index_select(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "index_select", gather)
+    try:
+        bridge.publish()  # Initial state is available without an advance or integration.
+        assert bridge_env.node.spins == 0
+        assert len(bridge_env.node.published["/clock"]) == 1
+        bridge_env.node.pending.append(_command(["a"], [10.0]))
+        actions = bridge._actions
+        exchanges = []
+        target = 1.0
+        for step in range(2001):
+            elapsed = step * 0.0005
+            bridge_env.env.sim.time = elapsed
+            due = elapsed >= (len(exchanges) + 1) * period
+            before_gathers = len(gathers)
+            assert bridge.advance() is actions
+            if due:
+                exchanges.append(step)
+                target = 9.0 + len(exchanges)
+            assert actions[0, 1].item() == target
+            bridge_env.env.sim.time = (step + 1) * 0.0005
+            bridge.publish()
+            assert len(gathers) - before_gathers == (3 if due else 0)
+            assert bridge_env.node.spins == 3 * len(exchanges)
+            assert len(bridge_env.node.published["/clock"]) == len(exchanges) + 1
+            if due:
+                bridge_env.node.pending.append(_command(["a"], [target + 1.0]))
+        assert len(exchanges) == 150
+        assert exchanges[:3] == [14, 27, 40]
+        assert {right - left for left, right in zip(exchanges, exchanges[1:])} == {13, 14}
+        expected_stamps = [0] + [(step + 1) * 500000 for step in exchanges]
+        for topic in ("/clock", "/joint_states", "/tf"):
+            messages = bridge_env.node.published[topic]
+            assert len(messages) == 151
+            if topic == "/clock":
+                stamps = [message.clock for message in messages]
+            elif topic == "/tf":
+                stamps = [message.transforms[0].header.stamp for message in messages]
+            else:
+                stamps = [message.header.stamp for message in messages]
+            assert [stamp.sec * 1000000000 + stamp.nanosec for stamp in stamps] == expected_stamps
+    finally:
+        bridge.close()
+
+
+def test_exchange_pause_resume_episode_reset_and_time_jump(bridge_env):
+    bridge_env.env.cfg.ros2_bridge.exchange_period_s = 1.0 / 150.0
+    bridge = Ros2Bridge(bridge_env.env)
+    try:
+        bridge.publish()
+        bridge_env.node.pending.append(_command(["a"], [7.0]))
+        for _ in range(10):  # Paused attempts neither poll ROS nor republish state.
+            bridge.advance()
+            bridge.publish()
+        assert bridge_env.node.spins == 0
+        assert len(bridge_env.node.published["/clock"]) == 1
+        bridge_env.env.sim.time = 0.007
+        assert bridge.advance()[0, 1].item() == 7.0
+        bridge_env.env.sim.time = 0.0075
+        bridge.publish()
+        bridge_env.asset.data.joint_pos.torch.zero_()
+        bridge_env.env.episode_length_buf = torch.zeros(1)
+        bridge_env.env.sim.steps = 0
+        bridge_env.node.pending.append(_command(["a"], [8.0]))
+        for _ in range(10):
+            assert bridge.advance()[0, 1].item() == 7.0
+            bridge.publish()
+        assert bridge_env.node.spins == 3
+        bridge_env.env.sim.time = 0.041  # Cross several deadlines in one integration.
+        assert bridge.advance()[0, 1].item() == 8.0
+        bridge_env.env.sim.time = 0.0415
+        bridge.publish()
+        bridge.publish()
+        assert len(bridge_env.node.published["/clock"]) == 3  # No catch-up burst.
+        bridge_env.node.pending.append(_command(["a"], [9.0]))
+        bridge_env.env.sim.time = 0.0465
+        assert bridge.advance()[0, 1].item() == 8.0
+        bridge.publish()
+        bridge_env.env.sim.time = 0.047
+        assert bridge.advance()[0, 1].item() == 9.0
+        bridge_env.env.sim.time = 0.0475
+        bridge.publish()
+        assert bridge_env.node.spins == 9
+        assert len(bridge_env.node.published["/clock"]) == 4
+    finally:
+        bridge.close()
+
+
+def test_default_zero_period_keeps_every_step_exchange_even_while_paused(bridge_env):
+    assert bridge_env.env.cfg.ros2_bridge.exchange_period_s == 0.0
+    bridge = Ros2Bridge(bridge_env.env)
+    try:
+        bridge.publish()
+        for value in (4.0, 5.0, 6.0):
+            bridge_env.node.pending.append(_command(["a"], [value]))
+            assert bridge.advance()[0, 1].item() == value
+            bridge.publish()
+        assert bridge_env.node.spins == 9
+        assert len(bridge_env.node.published["/clock"]) == 4
+        assert all(message.clock.nanosec == 0 for message in bridge_env.node.published["/clock"])
+    finally:
+        bridge.close()
+
+
+def test_exchange_drains_arm_gripper_and_clock_callbacks_at_each_boundary(bridge_env):
+    bridge_env.env.cfg.ros2_bridge.exchange_period_s = 1.0 / 150.0
+    bridge = Ros2Bridge(bridge_env.env)
+    clock_callbacks = []
+    try:
+        bridge.publish()
+        for elapsed, value in ((0.007, 4.0), (0.0135, 8.0), (0.020, 12.0)):
+            bridge_env.node.pending.extend(
+                [
+                    lambda: clock_callbacks.append(True),  # use_sim_time owns a subscription too.
+                    _command(["unknown"], [value]),  # Rejection must not stop the drain.
+                    _command(["a", "c"], [value, value + 1.0]),
+                    _command(["b"], [value + 2.0]),
+                    _command(["a"], [value + 3.0]),  # Last received target wins per joint.
+                ]
+            )
+            bridge_env.env.sim.time = elapsed - 0.0005
+            held = bridge._actions.clone()
+            torch.testing.assert_close(bridge.advance(), held)
+            assert len(bridge_env.node.pending) == 5
+            bridge_env.env.sim.time = elapsed
+            torch.testing.assert_close(bridge.advance(), torch.tensor([[value + 1.0, value + 3.0, value + 2.0]]))
+            assert not bridge_env.node.pending
+            bridge_env.env.sim.time = elapsed + 0.0005
+            bridge.publish()
+        assert len(clock_callbacks) == 3
+        assert bridge_env.node.spins == 33  # Five callback/timeout pairs plus one empty pass each.
+        assert len(bridge_env.node.warnings) == 3
+        assert len(bridge_env.node.published["/clock"]) == 4
+    finally:
+        bridge.close()
+
+
 @pytest.mark.parametrize("invalid", ["multiple_envs", "offset", "scale", "clip", "unselected", "duplicate_joint"])
 def test_unsupported_action_contract_fails_before_creating_ros_node(bridge_env, invalid):
     if invalid == "multiple_envs":
@@ -294,19 +472,22 @@ def test_bridge_configuration_supports_native_copy_and_nested_overrides():
     assert TaskCfg().ros2_bridge.joint_command_topic == "/joint_commands"
 
 
-def test_ros2_real_private_context_transport(bridge_model):
+@pytest.mark.parametrize("period", [0.0, 1.0 / 150.0])
+def test_ros2_real_private_context_transport(bridge_model, period):
     """Exercise actual Jazzy executors and message serialization without a simulator."""
     import time
     import uuid
 
     rclpy = pytest.importorskip("rclpy")
     from rclpy.context import Context
+    from rclpy.duration import Duration
     from rclpy.executors import SingleThreadedExecutor
     from sensor_msgs.msg import JointState as RosJointState
 
     prefix = f"/isaaclab_test_{uuid.uuid4().hex}"
     bridge_model.env.cfg.ros2_bridge.joint_state_topic = prefix + "/state"
     bridge_model.env.cfg.ros2_bridge.joint_command_topic = prefix + "/command"
+    bridge_model.env.cfg.ros2_bridge.exchange_period_s = period
     bridge_model.env.sim.steps = 250
     bridge_model.env.sim.time = 0.125
     context = Context()
@@ -317,30 +498,59 @@ def test_ros2_real_private_context_transport(bridge_model):
     states = []
     subscription = peer.create_subscription(RosJointState, prefix + "/state", states.append, 10)
     publisher = peer.create_publisher(RosJointState, prefix + "/command", 10)
+    gripper_publisher = peer.create_publisher(RosJointState, prefix + "/command", 10)
     bridge = None
     try:
         bridge = Ros2Bridge(bridge_model.env)
         assert bridge._node.get_parameter("use_sim_time").value is True
-        command = RosJointState()
-        command.name = ["a"]
-        command.position = [7.0]
-        command.velocity = [2.0]
-        command.effort = [3.0]
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            publisher.publish(command)
-            actions = bridge.advance()
-            bridge.publish()
+            if (
+                publisher.get_subscription_count()
+                and gripper_publisher.get_subscription_count()
+                and bridge._state_pub.get_subscription_count()
+                and bridge._clock_pub.get_subscription_count()
+            ):
+                break
             executor.spin_once(timeout_sec=0.01)
-            if states and actions[0, 1].item() == 7.0:
+        else:
+            pytest.fail("Private-context ROS endpoints did not discover each other.")
+        bridge.publish()  # Queue the bridge's own use_sim_time clock callback too.
+        assert bridge._clock_pub.wait_for_all_acked(Duration(seconds=5.0))
+        malformed = RosJointState()
+        malformed.name = ["unknown"]
+        malformed.position = [99.0]
+        publisher.publish(malformed)
+        command = RosJointState()
+        command.name = ["a", "c"]
+        command.position = [7.0, 9.0]
+        command.velocity = [2.0, 3.0]
+        command.effort = [3.0, 4.0]
+        publisher.publish(command)
+        gripper = RosJointState()
+        gripper.name = ["b"]
+        gripper.position = [8.0]
+        gripper_publisher.publish(gripper)
+        assert publisher.wait_for_all_acked(Duration(seconds=5.0))
+        assert gripper_publisher.wait_for_all_acked(Duration(seconds=5.0))
+        if period:
+            torch.testing.assert_close(bridge.advance(), torch.tensor([[3.0, 1.0, 2.0]]))
+        bridge_model.env.sim.time = 0.132
+        actions = bridge.advance()  # Exactly one exchange must consume every queued command.
+        torch.testing.assert_close(actions, torch.tensor([[9.0, 7.0, 8.0]]))
+        bridge_model.env.sim.time = 0.1325
+        bridge.publish()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.01)
+            if states and states[-1].header.stamp.nanosec == 132500000:
                 break
         else:
-            pytest.fail("Private-context ROS bridge did not exchange real JointState messages.")
-        torch.testing.assert_close(actions, torch.tensor([[3.0, 7.0, 2.0]]))
+            pytest.fail("Private-context ROS bridge did not publish the exchanged state.")
         assert list(states[-1].position) == [2.0, 3.0, 1.0]
         assert list(states[-1].effort) == [20.0, 30.0, 10.0]
         stamp = states[-1].header.stamp
-        assert (stamp.sec, stamp.nanosec) == (0, 125000000)
+        assert (stamp.sec, stamp.nanosec) == (0, 132500000)
         assert subscription is not None
     finally:
         if bridge is not None:

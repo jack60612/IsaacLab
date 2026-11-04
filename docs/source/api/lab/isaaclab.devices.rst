@@ -238,7 +238,9 @@ absolute positions in radians (meters for prismatic joints). Optional velocity a
 effort arrays must be empty or match the name count and contain finite values.
 These feedforward fields are validated but ignored by the position-action bridge,
 allowing stock topic-based ROS control publishers to send full JointState commands.
-Named partial commands update only those position targets.
+Named partial commands update only those position targets. At each exchange the
+executor drains all ready callbacks, so separate arm and gripper publishers are
+processed before the same physics step; the last received value wins per joint.
 Unspecified joints hold their previous target, initialized from the state after
 ``env.reset()``. Targets deliberately persist across automatic episode resets;
 they are not reinterpreted as offsets or reset to zero. Malformed, duplicate,
@@ -257,9 +259,28 @@ xyzw order. All messages share the backend's integrated simulation time from
 Paused or stopped step attempts that do not integrate physics leave the timestamps
 unchanged. Backend-owned decimation is already included in this time; the bridge
 does not multiply it again or use wall-clock time.
-Commands are processed just before ``env.step`` and state is published afterward,
-as well as once after the initial reset. The bridge owns a private ROS context and
-a single-threaded executor bound to that context; both close before the environment.
+The host calls ``advance()`` before every ``env.step()`` and ``publish()`` afterward,
+as well as publishing once after the initial reset. Set ``exchange_period_s`` to a
+finite, nonnegative interval in seconds to limit ROS work without changing the
+environment's physics timestep or decimation. The default, zero, preserves an
+exchange on every environment step. With a positive period, the initial state is
+published immediately; subsequent command processing occurs at the first pre-step
+integrated-time sample meeting each deadline, followed by one post-step publication
+of joint state, TF and clock. Between exchanges, the same action tensor holds its
+targets, without polling ROS, gathering state or copying it to the CPU.
+
+Deadlines are anchored to the initial publication time, not accumulated from the
+last exchange. For example, a period of ``1.0 / 150.0`` with 0.5 ms physics steps
+alternates 13- and 14-step intervals instead of rounding to a fixed step count.
+Starting at zero, the first command exchange is at 7 ms and its post-step
+publication at 7.5 ms. Thus publication can trail a deadline by up to two physics
+steps with this paired ordering; messages carry their actual integrated time,
+not the ideal deadline. Paused/stopped attempts perform no exchanges once the
+initial state is published until integrated time meets the next deadline.
+Episode resets do not restart the cadence. A larger integration jump produces one
+exchange and skips missed deadlines, never a burst of stale publications.
+The bridge owns a private ROS context and a single-threaded executor bound to that
+context; both close before the environment.
 
 .. autoclass:: isaaclab.devices.ros2.Ros2BridgeCfg
    :members:

@@ -38,6 +38,8 @@ class Ros2BridgeCfg:
     world_frame: str = "world"
     frame_prefix: str = ""
     """Prefix for published TF child frames, e.g. ``sim/`` to isolate measured frames."""
+    exchange_period_s: float = 0.0
+    """Integrated-time interval between exchanges; zero exchanges every environment step."""
 
 
 def _tensor(value: Any) -> torch.Tensor:
@@ -63,6 +65,13 @@ class Ros2Bridge:
         self.cfg = self._env.cfg.ros2_bridge
         if not isinstance(self.cfg, Ros2BridgeCfg):
             raise ValueError("env.cfg.ros2_bridge must be a Ros2BridgeCfg.")
+        period = self.cfg.exchange_period_s
+        if not math.isfinite(period) or period < 0.0:
+            raise ValueError("ros2_bridge.exchange_period_s must be finite and nonnegative.")
+        self._exchange_period_s = period
+        self._exchange_origin: float | None = None
+        self._next_exchange = 1
+        self._exchange_pending = True
         if self._env.num_envs != 1:
             raise ValueError("The ROS 2 bridge requires exactly one environment.")
         for field in ("joint_names", "action_terms", "body_names"):
@@ -135,7 +144,7 @@ class Ros2Bridge:
             import rclpy
             from geometry_msgs.msg import TransformStamped
             from rclpy.context import Context
-            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.executors import SingleThreadedExecutor, TimeoutException
             from rclpy.parameter import Parameter
             from rosgraph_msgs.msg import Clock
             from sensor_msgs.msg import JointState
@@ -146,6 +155,7 @@ class Ros2Bridge:
                 "Source /opt/ros/jazzy/setup.bash and use Python 3.12 before launching --ros2."
             ) from exc
         self._context = Context()
+        self._timeout_exception = TimeoutException
         self._node = None
         self._executor = None
         try:
@@ -206,15 +216,50 @@ class Ros2Bridge:
             self._actions[0, self._command_indices[name]] = value
 
     def advance(self) -> torch.Tensor:
-        """Process ready commands without waiting and return the persistent action tensor."""
-        self._executor.spin_once(timeout_sec=0.0)
+        """Process commands only when an exchange is due; otherwise return held targets."""
+        if self._exchange_period_s:
+            elapsed = self._env.sim.physics_manager.get_simulation_time()
+            if self._exchange_origin is None:
+                self._exchange_origin = elapsed
+            elif elapsed < self._exchange_origin + self._next_exchange * self._exchange_period_s:
+                return self._actions
+            else:
+                # Anchor to the initial publication, not the quantized physics grid.
+                # Skip missed intervals after a time jump instead of replaying a burst.
+                self._next_exchange = max(
+                    self._next_exchange + 1,
+                    math.floor((elapsed - self._exchange_origin) / self._exchange_period_s) + 1,
+                )
+            self._exchange_pending = True
+        # Each hardware system can publish its own partial command. Drain all ready
+        # callbacks so arm and gripper targets reach the same physics step, rather
+        # than letting one spin_once per exchange accumulate a stale command queue.
+        dispatched = False
+        while True:
+            try:
+                handler, _, _ = self._executor.wait_for_ready_callbacks(timeout_sec=0.0)
+            except self._timeout_exception:
+                # Jazzy's cached readiness generator can time out after a pass
+                # that yielded callbacks, even with more messages on that entity.
+                if not dispatched:
+                    break
+                dispatched = False
+                continue
+            handler()
+            handler.result()  # Propagate callback failures, as SingleThreadedExecutor does.
+            dispatched = True
         return self._actions
 
     def publish(self) -> None:
         """Publish measured joints, world transforms and the actual simulation clock."""
+        if self._exchange_period_s and not self._exchange_pending:
+            return
         # Backend time advances only after integration and already includes decimation.
         # SimulationContext's step counter also counts paused/stopped attempts.
         elapsed = self._env.sim.physics_manager.get_simulation_time()
+        if self._exchange_origin is None:
+            self._exchange_origin = elapsed
+        self._exchange_pending = False
         nanoseconds = round(elapsed * 1_000_000_000)
         sec, nanosec = divmod(nanoseconds, 1_000_000_000)
         for stamp in (self._clock_msg.clock, self._state_msg.header.stamp):

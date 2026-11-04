@@ -1,2 +1,4 @@
 * Added an optional lockstep ROS 2 joint-position bridge with named partial commands, measured joint states, simulation clock, and configured world-frame body transforms.
 * The ROS 2 bridge timestamps messages with backend-integrated simulation time, including backend-owned decimation, so paused or stopped attempts that do not integrate physics cannot advance the clock.
+* Added ``Ros2BridgeCfg.exchange_period_s`` to exchange commands, measured states, TF and clock on anchored integrated-time deadlines while holding actions between exchanges, without changing physics stepping or environment decimation.
+* Drain all ready ROS callbacks at each exchange so independent arm and gripper command publishers cannot accumulate stale partial targets behind simulation-clock callbacks.
