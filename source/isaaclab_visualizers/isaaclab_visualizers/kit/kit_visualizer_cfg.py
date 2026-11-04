@@ -51,6 +51,26 @@ class KitVisualizerCfg(VisualizerCfg):
     headless: bool = False
     """Run without creating viewport windows when supported by the app."""
 
+    enable_picking: bool = True
+    """Enable Shift+left-drag with supported Newton rigid-body solvers.
+
+    Requires the Isaac Sim fork's ``NewtonViewportInteraction`` adapter and
+    Newton's public ``newton.viewer.Picking`` API. Disabled in headless mode.
+    """
+
+    pick_stiffness: float = 50.0
+    """Picking spring stiffness [1/s²], matching Newton Picking's default."""
+
+    pick_damping: float = 5.0
+    """Picking damping [1/s], matching Newton Picking's default."""
+
+    pick_max_acceleration: float = 5.0
+    """Finite nonnegative linear/rotational acceleration bound [g].
+
+    Matches Newton Picking's default; increase explicitly for stronger bounded
+    interaction. The Newton picker validates and enforces this bound.
+    """
+
     dock_position: str = "SAME"
     """Dock position for the streaming image panel and any new viewport window.
 

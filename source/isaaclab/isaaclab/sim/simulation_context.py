@@ -697,7 +697,7 @@ class SimulationContext:
     def _requires_pre_capture_newton_init(cfg: Any) -> bool:
         """Return whether a config contributes Newton picking inputs to capture."""
         return (
-            getattr(cfg, "visualizer_type", None) in {"newton_gl", "newton_rtx"}
+            getattr(cfg, "visualizer_type", None) in {"kit", "newton_gl", "newton_rtx"}
             and bool(getattr(cfg, "enable_picking", False))
             and not bool(getattr(cfg, "headless", False))
         )
