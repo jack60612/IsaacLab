@@ -48,6 +48,7 @@ class KitVisualizer(BaseVisualizer):
     """Kit visualizer using Isaac Sim viewport."""
 
     _timeline_auto_update: ClassVar[bool | None] = None
+    _timeline_play_simulations: ClassVar[bool | None] = None
     _timeline_control_owner_count: ClassVar[int] = 0
 
     def __init__(self, cfg: VisualizerCfg):
@@ -61,6 +62,7 @@ class KitVisualizer(BaseVisualizer):
         self._simulation_app = None
         self._viewport_window = None
         self._viewport_api = None
+        self._newton_picking = None
         self._step_counter = 0
         self._hidden_env_visibilities: dict[str, str] = {}
         # PointInstancer prim path -> (had authored invisibleIds, previous value) for partial viz restore.
@@ -166,6 +168,53 @@ class KitVisualizer(BaseVisualizer):
                 self._key_event_source = KitKeyEventSource(omni.appwindow.get_default_app_window())
             except Exception:
                 logger.exception("[KitVisualizer] Keyboard input is unavailable")
+        self._prepare_newton_picking()
+
+    def _prepare_newton_picking(self) -> None:
+        """Bind the native Newton model before solver graph capture."""
+        sim = self._sim
+        if (
+            not self.cfg.backend.enable_picking
+            or self._runtime_headless
+            or self.physics_backend != "newton"
+            or not sim.cfg.physics.solver_cfg.class_type.applies_body_forces(
+                sim.cfg.physics.solver_cfg, sim.backend_manager.backend.solver
+            )
+        ):
+            return
+        if self._newton_picking is None:
+            from .newton_picking import KitNewtonPicking
+
+            self._newton_picking = KitNewtonPicking(
+                sim.backend_manager,
+                self.cfg.backend,
+                UsdGeom.GetStageMetersPerUnit(sim.stage),
+                self._get_picking_visible_env_ids(sim.stage),
+            )
+        else:
+            self._newton_picking.rebind()
+
+    def reset(self, soft: bool = False) -> None:
+        """Release dragging and rebind native inputs after a hard reset."""
+        if self._newton_picking is not None:
+            if soft:
+                self._newton_picking.release()
+            else:
+                self._prepare_newton_picking()
+
+    def _get_picking_visible_env_ids(self, stage: Usd.Stage) -> list[int] | None:
+        """Intersect configured visibility with the viewport camera's partition."""
+        visible = self._env_ids
+        if self._controlled_camera_path is None:
+            return visible
+        camera = stage.GetPrimAtPath(self._controlled_camera_path)
+        if not camera.IsValid():
+            return visible
+        partition = camera.GetAttribute("omni:scenePartition").Get()
+        if partition is None:
+            return visible
+        env_ids = range(self._sim.get_scene_data_provider().num_envs) if visible is None else visible
+        return [env_id for env_id in env_ids if partition == f"env_{env_id}"]
 
     def step(self, dt: float) -> None:
         """Advance visualizer/UI updates for one simulation step.
@@ -206,6 +255,9 @@ class KitVisualizer(BaseVisualizer):
 
     def close(self) -> None:
         """Close viewport resources and restore temporary state."""
+        if self._newton_picking is not None:
+            self._newton_picking.close()
+            self._newton_picking = None
         if not self._is_initialized:
             return
         self._close_key_event_source()
@@ -246,6 +298,11 @@ class KitVisualizer(BaseVisualizer):
         if not self._owns_kit_timeline:
             if KitVisualizer._timeline_control_owner_count == 0:
                 KitVisualizer._timeline_auto_update = timeline.is_auto_updating()
+                settings = get_settings_manager()
+                KitVisualizer._timeline_play_simulations = settings.get("/app/player/playSimulations")
+                # Disable the native timeline physics owner before publishing
+                # Play; auto-update alone does not prevent PhysX stage parsing.
+                settings.set("/app/player/playSimulations", False)
             KitVisualizer._timeline_control_owner_count += 1
             self._owns_kit_timeline = True
         # The toolbar still reflects play/pause while the selected backend remains the only time owner.
@@ -255,6 +312,8 @@ class KitVisualizer(BaseVisualizer):
 
     def pause(self) -> None:
         """Show the paused state in Kit's toolbar without advancing Kit physics."""
+        if self._newton_picking is not None:
+            self._newton_picking.release()
         if not self._controls_kit_timeline:
             return
         import omni.timeline
@@ -264,6 +323,8 @@ class KitVisualizer(BaseVisualizer):
 
     def stop(self) -> None:
         """Show the stopped state in Kit's toolbar without advancing Kit physics."""
+        if self._newton_picking is not None:
+            self._newton_picking.release()
         if not self._controls_kit_timeline or not self._owns_kit_timeline:
             return
         import omni.timeline
@@ -282,6 +343,10 @@ class KitVisualizer(BaseVisualizer):
                 KitVisualizer._timeline_auto_update = None
                 if timeline_auto_update is not None:
                     timeline.set_auto_update(timeline_auto_update)
+                play_simulations = KitVisualizer._timeline_play_simulations
+                KitVisualizer._timeline_play_simulations = None
+                if play_simulations is not None:
+                    get_settings_manager().set("/app/player/playSimulations", play_simulations)
 
     def render_rgb_array(self) -> np.ndarray:
         """Return an RGB frame captured from the Kit viewport camera.
