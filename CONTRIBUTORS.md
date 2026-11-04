@@ -116,6 +116,7 @@ Guidelines for modifications:
 * Huihua Zhao
 * Iretiayo Akinola
 * Ivan Wang
+* Jack Nelson
 * Jack Zeng
 * Jan Kerner
 * Jean Tampon
