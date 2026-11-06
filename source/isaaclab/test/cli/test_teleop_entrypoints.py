@@ -104,3 +104,57 @@ def test_teleop_rejects_unknown_workflow():
         cli.cli()
 
     run_python.assert_not_called()
+
+
+def test_teleop_environment_creation_failure_exits_nonzero_and_cleans_up(source_checkout_root: Path):
+    """A failed Gym constructor must not look like a successful teleoperation session.
+
+    Execute the script's actual run function in a subprocess, isolating its simulator-only
+    imports so the failure/cleanup boundary can be tested without starting Kit.
+    """
+    script = source_checkout_root.joinpath(*TELEOP_WORKFLOWS["run"])
+    code = """
+import ast
+import logging
+import sys
+from contextlib import ExitStack
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+tree = ast.parse(Path(sys.argv[1]).read_text())
+function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "run_teleoperation")
+annotations = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+module = ast.Module(body=[annotations, function], type_ignores=[])
+ast.fix_missing_locations(module)
+
+def close():
+    print("CAMERA_FEED_CLOSED", flush=True)
+
+def fail_make(*args, **kwargs):
+    raise RuntimeError("gym constructor regression sentinel")
+
+modules = {
+    "isaaclab_physx.renderers.isaac_rtx_renderer_utils": {"apply_isaac_rtx_global_settings": None},
+    "isaaclab_teleop": {"XrCameraFeedSession": SimpleNamespace(prepare=lambda *args, **kwargs:
+                        SimpleNamespace(close=close))},
+    "isaaclab.devices": {"Se3Keyboard": None, "Se3KeyboardCfg": None},
+}
+for name, attributes in modules.items():
+    imported = ModuleType(name)
+    vars(imported).update(attributes)
+    sys.modules[name] = imported
+namespace = {
+    "args_cli": SimpleNamespace(teleop_device="keyboard", xr=False, disable_external_cameras=True, task="BrokenTask"),
+    "gym": SimpleNamespace(make=fail_make),
+    "logger": logging.getLogger("teleop-test"),
+    "_rtx_rendering_requested": lambda args: False,
+}
+exec(compile(module, sys.argv[1], "exec"), namespace)
+with ExitStack() as cleanup:
+    namespace["run_teleoperation"](object(), False, cleanup)
+"""
+    result = subprocess.run([sys.executable, "-c", code, str(script)], capture_output=True, text=True, check=False)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "RuntimeError: gym constructor regression sentinel" in result.stderr
+    assert "Traceback (most recent call last)" in result.stderr
+    assert "CAMERA_FEED_CLOSED" in result.stdout

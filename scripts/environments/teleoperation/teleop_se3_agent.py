@@ -321,8 +321,8 @@ def run_teleoperation(env_cfg: ManagerBasedRLEnvCfg, use_isaac_teleop: bool, cle
                 " ignored."
             )
     except Exception as e:
-        logger.error(f"Failed to create environment: {e}")
-        return
+        logger.exception(f"Failed to create environment: {e}")
+        raise
 
     # Flags for controlling teleoperation flow
     should_reset_recording_instance = False
