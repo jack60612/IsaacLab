@@ -350,6 +350,11 @@ class MockNewtonArticulationView:
         return self._is_fixed_base
 
     @property
+    def is_floating_base(self) -> bool:
+        """Whether the root joint is free (the mock root is free unless the base is fixed)."""
+        return not self._is_fixed_base
+
+    @property
     def root_joint_type(self) -> int:
         """Type of the root joint: fixed for a fixed base, free otherwise."""
         return int(JointType.FIXED if self._is_fixed_base else JointType.FREE)

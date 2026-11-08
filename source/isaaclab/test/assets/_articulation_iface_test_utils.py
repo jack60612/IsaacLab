@@ -356,6 +356,9 @@ def create_newton_articulation(
     mock_model.max_dofs_per_articulation = total_dofs
     mock_model.joint_dof_count = num_instances * total_dofs
     mock_model.body_count = num_instances * num_bodies
+    # Non-floating roots bind to their ``model.joint_X_p`` rows; alias those rows to the mock root transforms.
+    mock_model.articulation_start = wp.array(np.arange(num_instances + 1), dtype=wp.int32, device=device)
+    mock_model.joint_X_p = mock_view.get_root_transforms(None).reshape((-1,))
     mock_view.model = mock_model
     mock_state = MagicMock()
     mock_control = MagicMock()

@@ -31,6 +31,7 @@ from isaaclab_newton.physics import NewtonManager as SimulationManager
 from ..kernels import vec13f
 
 if TYPE_CHECKING:
+    from newton import Model, State
     from newton.selection import ArticulationView
 
 # import logger
@@ -66,6 +67,39 @@ def _unsupported_fixed_tendon_property(name: str) -> NotImplementedError:
     reason = _UNSUPPORTED_FIXED_TENDON_PROPERTIES[name]
     label = name.replace("_", " ")
     return NotImplementedError(f"Fixed tendon {label} is not implemented in Isaac Lab's Newton backend: {reason}.")
+
+
+def _root_link_pose_binding(root_view: ArticulationView, model: Model, state: State) -> wp.array:
+    """Return a zero-copy binding of the per-instance root link pose.
+
+    Floating roots are bound to their root coordinates in ``state.joint_q``. Non-floating roots are
+    bound to the root-joint rows of ``model.joint_X_p``, so pose writes into the binding move the root.
+    :meth:`ArticulationView.get_root_transforms` is not used for those: when the view's joint selection
+    is indexed (e.g. interior FIXED joints are excluded), it returns a staging copy of ``joint_X_p``,
+    and writes into that copy never reach the model or the solver.
+
+    Args:
+        root_view: The articulation view.
+        model: The Newton model.
+        state: The Newton state holding floating root coordinates.
+
+    Returns:
+        The root link poses. Shape is (num_instances,), dtype ``wp.transformf``.
+    """
+    if root_view.is_floating_base:
+        return root_view.get_root_transforms(state)[:, 0]
+    root_joints = model.articulation_start.numpy()[root_view.articulation_ids.numpy()[:, 0]]
+    # ArticulationView rejects non-uniform strides between worlds, so one stride spans all root rows.
+    joint_stride = int(root_joints[1] - root_joints[0]) if len(root_joints) > 1 else 1
+    joint_X_p = model.joint_X_p
+    return wp.array(
+        ptr=joint_X_p.ptr + int(root_joints[0]) * joint_X_p.strides[0],
+        dtype=wp.transformf,
+        shape=(len(root_joints),),
+        strides=(joint_stride * joint_X_p.strides[0],),
+        device=joint_X_p.device,
+        copy=False,
+    )
 
 
 class ArticulationData(BaseArticulationData):
@@ -1530,7 +1564,9 @@ class ArticulationData(BaseArticulationData):
         self._num_spatial_tendons = 0  # spatial tendons not supported
 
         # -- root properties
-        self._sim_bind_root_link_pose_w = self._root_view.get_root_transforms(SimulationManager.get_state_0())[:, 0]
+        self._sim_bind_root_link_pose_w = _root_link_pose_binding(
+            self._root_view, SimulationManager.get_model(), SimulationManager.get_state_0()
+        )
         # ``get_root_velocities`` returns ``None`` for fixed-base articulations; the
         # ``wp.zeros`` fallback set by :meth:`_create_buffers` must survive subsequent
         # resets, so only overwrite when the solver actually exposes the binding.

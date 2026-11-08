@@ -30,6 +30,7 @@ import numpy as np
 import pytest
 import warp as wp
 from isaaclab_newton.assets.articulation import articulation as articulation_module
+from isaaclab_newton.assets.articulation.articulation_data import _root_link_pose_binding
 from isaaclab_newton.assets.rigid_object import rigid_object as rigid_object_module
 from isaaclab_newton.cloner import newton_physics_replicate
 from isaaclab_newton.physics import (
@@ -1033,6 +1034,136 @@ def test_fixed_root_pose_write_updates_solver(monkeypatch, asset_class, writer, 
     getattr(asset_class, writer)(asset, root_pose=target, skip_forward=True, **{selector: selection})
 
     np.testing.assert_allclose(solver.mjw_data.mocap_pos.numpy()[0, 0], target.numpy()[0, :3])
+
+
+def _station_model(root: str, interior_fixed: bool):
+    """Two worlds, each with another articulation ahead of a 4-link robot.
+
+    Like :meth:`Articulation._initialize_impl`, the returned view excludes FREE and FIXED joints, so an
+    interior FIXED joint makes the robot's joint selection indexed instead of a strided slice.
+    """
+    builder = ModelBuilder()
+    SolverMuJoCo.register_custom_attributes(builder)
+    inertia = wp.mat33(np.eye(3))
+    root_pose = wp.transform(wp.vec3(0.5, 0.0, 0.0), wp.quat_identity())
+    for _ in range(2):
+        builder.begin_world()
+        other = builder.add_link(mass=1.0, inertia=inertia)
+        builder.add_articulation([builder.add_joint_revolute(-1, other, axis=(0.0, 0.0, 1.0))], label="other")
+        base, upper, mount, tool = (builder.add_link(xform=root_pose, mass=1.0, inertia=inertia) for _ in range(4))
+        if root == "fixed":
+            root_joint = builder.add_joint_fixed(-1, base, parent_xform=root_pose)
+        else:
+            root_joint = builder.add_joint_free(base, parent_xform=root_pose)
+        add_interior = builder.add_joint_fixed if interior_fixed else builder.add_joint_revolute
+        joints = [
+            root_joint,
+            builder.add_joint_revolute(base, upper, axis=(0.0, 0.0, 1.0)),
+            add_interior(upper, mount),
+            builder.add_joint_revolute(mount, tool, axis=(0.0, 0.0, 1.0)),
+        ]
+        builder.add_articulation(joints, label="robot")
+        builder.end_world()
+    model = builder.finalize(device="cpu")
+    view = ArticulationView(model, "robot", verbose=False, exclude_joint_types=[JointType.FREE, JointType.FIXED])
+    return model, view
+
+
+def _root_writer_asset(model, view, state):
+    body_com = view.get_attribute("body_com", model)[:, 0]
+    data = SimpleNamespace(
+        root_link_pose_w=_root_link_pose_binding(view, model, state),
+        root_com_pose_w=wp.empty(view.count, dtype=wp.transform, device="cpu"),
+        _sim_bind_body_com_pos_b=body_com,
+        body_com_pos_b=body_com,
+    )
+    return SimpleNamespace(
+        root_view=view,
+        data=data,
+        device="cpu",
+        _ALL_ENV_MASK=wp.array([True] * view.count, dtype=wp.bool, device="cpu"),
+        _resolve_env_ids=lambda ids: ids,
+        _resolve_mask=lambda mask, default: default if mask is None else mask,
+        assert_shape_and_dtype=lambda *args: None,
+        assert_shape_and_dtype_mask=lambda *args: None,
+    )
+
+
+def _write_root_pose_to_env_1(asset, writer, selector, target_pos):
+    """Write ``target_pos`` to env 1 only, leaving env 0 at its current pose."""
+    target = wp.transform(wp.vec3(*target_pos), wp.quat_identity())
+    if selector == "env_ids":
+        root_pose = wp.array([target], dtype=wp.transform, device="cpu")
+        selection = wp.array([1], dtype=wp.int32, device="cpu")
+    else:
+        root_pose = wp.array([asset.data.root_link_pose_w.numpy()[0], target], dtype=wp.transform, device="cpu")
+        selection = wp.array([False, True], dtype=wp.bool, device="cpu")
+    getattr(articulation_module.Articulation, writer)(
+        asset, root_pose=root_pose, skip_forward=True, **{selector: selection}
+    )
+
+
+@pytest.mark.parametrize("interior_fixed", [True, False], ids=["indexed_joints", "strided_joints"])
+@pytest.mark.parametrize(
+    "writer, selector",
+    [
+        ("write_root_link_pose_to_sim_index", "env_ids"),
+        ("write_root_link_pose_to_sim_mask", "env_mask"),
+        ("write_root_com_pose_to_sim_index", "env_ids"),
+        ("write_root_com_pose_to_sim_mask", "env_mask"),
+    ],
+)
+def test_fixed_root_pose_write_reaches_model_behind_other_articulations(monkeypatch, interior_fixed, writer, selector):
+    """A fixed-root pose write moves ``model.joint_X_p``, MuJoCo's mocap body, and the stepped links.
+
+    Regression: with an indexed joint selection, ``ArticulationView.get_root_transforms`` returns a
+    staging copy of ``joint_X_p``. Binding the root pose to that copy made the write update only the
+    readback while the model, solver and links stayed at the old pose.
+    """
+    model, view = _station_model("fixed", interior_fixed)
+    root_joints = model.articulation_start.numpy()[view.articulation_ids.numpy()[:, 0]]
+    assert root_joints.tolist() == [1, 6]
+    joint_X_p = model.joint_X_p
+    joint_X_p_end = joint_X_p.ptr + joint_X_p.capacity
+    newton_binding = view.get_root_transforms(model)[:, 0]
+    assert (joint_X_p.ptr <= newton_binding.ptr < joint_X_p_end) != interior_fixed
+    state_0, state_1 = model.state(), model.state()
+    asset = _root_writer_asset(model, view, state_0)
+    solver = SolverMuJoCo(model)
+    monkeypatch.setattr(NewtonManager, "_solver", solver)
+    target_pos = (1.0, 2.0, 3.0)
+
+    _write_root_pose_to_env_1(asset, writer, selector, target_pos)
+
+    np.testing.assert_allclose(joint_X_p.numpy()[root_joints, :3], [(0.5, 0.0, 0.0), target_pos])
+    np.testing.assert_allclose(asset.data.root_link_pose_w.numpy()[:, :3], [(0.5, 0.0, 0.0), target_pos])
+    np.testing.assert_allclose(solver.mjw_data.mocap_pos.numpy()[:, 0], [(0.5, 0.0, 0.0), target_pos])
+    solver.step(state_0, state_1, model.control(), None, 1.0 / 120.0)
+    robot_links = view.get_attribute("body_q", state_1)[:, 0].numpy()
+    np.testing.assert_allclose(robot_links[0, :, :3], np.tile((0.5, 0.0, 0.0), (4, 1)), atol=1e-5)
+    np.testing.assert_allclose(robot_links[1, :, :3], np.tile(target_pos, (4, 1)), atol=1e-5)
+    # The binding is a live view of the model rows, not a copy.
+    assert joint_X_p.ptr <= asset.data.root_link_pose_w.ptr < joint_X_p_end
+
+
+@pytest.mark.parametrize("interior_fixed", [True, False], ids=["indexed_joints", "strided_joints"])
+def test_floating_root_pose_write_binds_state_joint_q(monkeypatch, interior_fixed):
+    """Floating roots stay bound to ``state.joint_q``; root writes leave ``model.joint_X_p`` alone."""
+    model, view = _station_model("free", interior_fixed)
+    state = model.state()
+    asset = _root_writer_asset(model, view, state)
+    joint_q = state.joint_q
+    assert joint_q.ptr <= asset.data.root_link_pose_w.ptr < joint_q.ptr + joint_q.capacity
+    monkeypatch.setattr(NewtonManager, "_solver", None)
+    joint_X_p_before = model.joint_X_p.numpy().copy()
+    root_q_before = view.get_root_transforms(state)[:, 0].numpy()
+    target_pos = (1.0, 2.0, 3.0)
+
+    _write_root_pose_to_env_1(asset, "write_root_link_pose_to_sim_index", "env_ids", target_pos)
+
+    root_q = view.get_root_transforms(state)[:, 0].numpy()
+    np.testing.assert_allclose(root_q[:, :3], [root_q_before[0, :3], target_pos])
+    np.testing.assert_array_equal(model.joint_X_p.numpy(), joint_X_p_before)
 
 
 def test_forward_consumes_existing_reset_masks(monkeypatch):
