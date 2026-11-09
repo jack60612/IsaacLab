@@ -684,15 +684,20 @@ class MockNewtonArticulationView:
         self._ensure_attribute("body_inertia").assign(inertias)
 
     def set_mock_jacobians(self, jacobians: wp.array) -> None:
-        """Set mock model-order Jacobian data directly for testing."""
+        """Set mock view-layout Jacobian data directly for testing."""
         self._jacobians = jacobians
 
     def set_mock_mass_matrices(self, mass_matrices: wp.array) -> None:
-        """Set mock model-order mass matrix data directly for testing."""
+        """Set mock view-layout mass matrix data directly for testing."""
         self._mass_matrices = mass_matrices
 
-    def eval_jacobian(self, state, J: wp.array, joint_S_s: wp.array) -> None:
-        """Write deterministic mock Jacobian data into Newton's output buffer."""
+    def view_jacobian_shape(self) -> tuple[int, int, int]:
+        """View-layout Jacobian shape: (count, links*6, dofs including a free root's 6)."""
+        return (self._count, 6 * self._link_count, self._joint_dof_count + (0 if self._is_fixed_base else 6))
+
+    def eval_jacobian(self, state, J: wp.array, joint_S_s: wp.array, *, view_layout: bool = False) -> None:
+        """Write deterministic mock Jacobian data into Newton's view-layout output buffer."""
+        assert view_layout, "the mock only implements Newton's view layout"
         if self._jacobians is None:
             self._jacobians = wp.zeros(
                 (self._count, self._link_count, 6, J.shape[2]),
@@ -701,8 +706,11 @@ class MockNewtonArticulationView:
             )
         J.assign(self._jacobians.reshape(J.shape))
 
-    def eval_mass_matrix(self, state, H: wp.array, J: wp.array, body_I_s: wp.array, joint_S_s: wp.array) -> None:
-        """Write deterministic mock mass matrix data into Newton's output buffer."""
+    def eval_mass_matrix(
+        self, state, H: wp.array, J: wp.array, body_I_s: wp.array, joint_S_s: wp.array, *, view_layout: bool = False
+    ) -> None:
+        """Write deterministic mock mass matrix data into Newton's view-layout output buffer."""
+        assert view_layout, "the mock only implements Newton's view layout"
         if self._mass_matrices is None:
             self._mass_matrices = wp.zeros(H.shape, dtype=wp.float32, device=self._device)
         H.assign(self._mass_matrices)

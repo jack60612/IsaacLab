@@ -501,6 +501,77 @@ def test_world_hinged_root_has_no_base_dofs(device):
     assert data.body_link_jacobian_w.torch.shape[-1] == data.mass_matrix.torch.shape[-1] == 1
 
 
+def _task_space_data(device, plant_links: int):
+    """Task-space data of a 2-DoF robot in two worlds, each behind a ``plant_links``-joint plant articulation."""
+    builder = ModelBuilder()
+    for _ in range(2):
+        builder.begin_world()
+        if plant_links:
+            plant, parent = [], -1
+            for _ in range(plant_links):
+                link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), com=(0.0, 0.0, 0.1))
+                plant.append(builder.add_joint_revolute(parent, link, axis=(1.0, 0.0, 0.0)))
+                parent = link
+            builder.add_articulation(plant, label="Plant")
+        base = builder.add_link(mass=4.0, inertia=wp.mat33(np.eye(3)), label="Robot/base")
+        arm = builder.add_link(mass=2.0, inertia=wp.mat33(np.eye(3)), com=(0.5, 0.0, 0.0), label="Robot/arm")
+        slider = builder.add_link(mass=3.0, inertia=wp.mat33(np.eye(3)), com=(0.25, 0.0, 0.0), label="Robot/slider")
+        builder.add_articulation(
+            [
+                builder.add_joint_fixed(-1, base),
+                builder.add_joint_revolute(base, arm, axis=(0.0, 1.0, 0.0), label="hinge"),
+                builder.add_joint_prismatic(arm, slider, axis=(1.0, 0.0, 0.0), label="slide"),
+            ],
+            label="Robot",
+        )
+        builder.end_world()
+    model = builder.finalize(device=device)
+    state, control = model.state(), model.control()
+    robot_q = np.asarray([[0.7, 0.4], [-0.3, 0.2]], dtype=np.float32)
+    joint_q = state.joint_q.numpy().reshape(2, -1)
+    joint_q[:, plant_links:] = robot_q
+    state.joint_q.assign(joint_q.reshape(-1))
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    backend_manager = NewtonManager(NewtonCfg())
+    backend_manager.backend = backend_stub(
+        model_changes=set(),
+        model=model,
+        state_0=state,
+        control=control,
+        solver=None,
+        kinematics_dirty=False,
+        state_version=0,
+        device=model.device,
+        transforms_may_change_on_graph_replay=False,
+    )
+    view = ArticulationView(model, "Robot", exclude_joint_types=[JointType.FIXED])
+    data = ArticulationData(view, device, backend_manager=backend_manager)
+    data._apply_ordering_maps_after_resolve()
+    return model, view, data
+
+
+@pytest.mark.parametrize("device", test_devices(DeviceScope.CPU))
+def test_task_space_scratch_is_sized_by_the_view(device):
+    """Jacobian/mass-matrix scratch follows this view's articulations, not the model-wide maxima.
+
+    A small robot co-resident with a large articulation per world must not allocate
+    ``model.articulation_count x 6 * max_joints_per_articulation x max_dofs_per_articulation``,
+    and its Jacobian and mass matrix must match the robot simulated alone.
+    """
+    model, view, data = _task_space_data(device, plant_links=12)
+    _, _, alone = _task_space_data(device, plant_links=0)
+    jacobian, mass_matrix = data.body_com_jacobian_w.warp.numpy(), data.mass_matrix.warp.numpy()
+
+    scratch = data._jacobian_buf_flat
+    assert tuple(scratch.shape) == view.view_jacobian_shape()
+    assert scratch.shape[0] == view.count == 2 < model.articulation_count
+    assert scratch.shape[1] < 6 * model.max_joints_per_articulation
+    assert scratch.shape[2] < model.max_dofs_per_articulation
+    assert data._mass_matrix_full_buf.shape == (2, scratch.shape[2], scratch.shape[2])
+    np.testing.assert_allclose(jacobian, alone.body_com_jacobian_w.warp.numpy(), atol=1e-6)
+    np.testing.assert_allclose(mass_matrix, alone.mass_matrix.warp.numpy(), atol=1e-6)
+
+
 @pytest.mark.parametrize(
     ("asset_class", "writer", "selector"),
     [
