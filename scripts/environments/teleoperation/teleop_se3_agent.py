@@ -122,6 +122,7 @@ from isaaclab_physx.renderers import IsaacRtxRendererGlobalSettingsCfg
 from isaaclab.devices.openxr import remove_camera_configs
 from isaaclab.devices.teleop_device_factory import create_teleop_device
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.envs.utils._manual_success import _prepare_success_term
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 
 import isaaclab_tasks  # noqa: F401
@@ -261,6 +262,11 @@ def main() -> None:  # noqa: C901
         # add termination condition for reaching the goal otherwise the environment won't reset
         env_cfg.terminations.object_reached_goal = DoneTerm(func=mdp.object_reached_goal)
 
+    # Evaluate success manually, like record_demos.py and replay_demos.py: an automatic
+    # success reset inside env.step() would hide the successful state (e.g. an object
+    # released at the success instant) before it is ever rendered. The operator resets.
+    success_term = _prepare_success_term(env_cfg)
+
     # When --teleop_device is explicitly provided, use the legacy teleop_devices path
     # even if isaac_teleop is configured. Otherwise prefer isaac_teleop when available.
     teleop_device_explicitly_set = args_cli.teleop_device is not None
@@ -278,10 +284,15 @@ def main() -> None:  # noqa: C901
             env_cfg = remove_camera_configs(env_cfg)
 
     with launch_simulation(env_cfg, args_cli), ExitStack() as cleanup:
-        run_teleoperation(env_cfg, use_isaac_teleop, cleanup)
+        run_teleoperation(env_cfg, use_isaac_teleop, cleanup, success_term)
 
 
-def run_teleoperation(env_cfg: ManagerBasedRLEnvCfg, use_isaac_teleop: bool, cleanup: ExitStack) -> None:  # noqa: C901
+def run_teleoperation(  # noqa: C901
+    env_cfg: ManagerBasedRLEnvCfg,
+    use_isaac_teleop: bool,
+    cleanup: ExitStack,
+    success_term: DoneTerm | None = None,
+) -> None:
     """Create the environment and teleop device, then run the teleoperation loop until the app is closed."""
     from isaaclab_physx.renderers.isaac_rtx_renderer_utils import apply_isaac_rtx_global_settings
     from isaaclab_teleop import XrCameraFeedSession
@@ -461,9 +472,17 @@ def run_teleoperation(env_cfg: ManagerBasedRLEnvCfg, use_isaac_teleop: bool, cle
     has_window = env.sim.has_gui and not env.sim.get_setting("/isaaclab/xr/auto_start")
     control_keyboard = _make_control_keyboard(teleop_interface, use_isaac_teleop, has_window)  # noqa: F841
 
+    # Success is reported once per episode; only the operator's reset starts a new one.
+    success_func = None
+    if success_term is not None:
+        success_func = success_term.func
+        if isinstance(success_func, str):
+            success_func = string_to_callable(success_func)
+
     def run_loop():
         """Inner function to run the teleop loop with access to nonlocal variables."""
         nonlocal should_reset_recording_instance, teleoperation_active
+        success_reported = False
 
         # reset environment
         env.reset()
@@ -505,6 +524,13 @@ def run_teleoperation(env_cfg: ManagerBasedRLEnvCfg, use_isaac_teleop: bool, cle
                         env.step(actions)
                         # render controller haptics from post-step contact forces
                         haptic_update()
+                        if (
+                            success_func is not None
+                            and not success_reported
+                            and bool(success_func(env, **success_term.params).any())
+                        ):
+                            success_reported = True
+                            print("Success — press 'R' to reset the environment.")
                     else:
                         env.sim.render()
                         # not stepping: zero haptics so a paused grip stops buzzing
@@ -515,6 +541,7 @@ def run_teleoperation(env_cfg: ManagerBasedRLEnvCfg, use_isaac_teleop: bool, cle
                         teleop_interface.reset()
                         camera_feed_session.refresh()
                         should_reset_recording_instance = False
+                        success_reported = False
                         print("Environment reset complete")
             except Exception as e:
                 logger.error(f"Error during simulation step: {e}")
