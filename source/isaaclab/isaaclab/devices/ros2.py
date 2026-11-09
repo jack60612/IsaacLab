@@ -39,7 +39,12 @@ class Ros2BridgeCfg:
     frame_prefix: str = ""
     """Prefix for published TF child frames, e.g. ``sim/`` to isolate measured frames."""
     exchange_period_s: float = 0.0
-    """Integrated-time interval between exchanges; zero exchanges every environment step."""
+    """Integrated-time interval between exchanges; zero exchanges every environment step.
+
+    With a positive period, each environment step ends on the first physics step at or after
+    the next anchored deadline (at most ``cfg.decimation`` physics steps per environment step),
+    so exchanges occur on the same physics steps as when stepping one physics step at a time.
+    """
 
 
 def _tensor(value: Any) -> torch.Tensor:
@@ -51,7 +56,9 @@ class Ros2Bridge:
     """Own a ROS node, persistent position targets and reusable state messages.
 
     Call :meth:`advance` immediately before each environment step and
-    :meth:`publish` immediately afterward. Commands are named, partial absolute
+    :meth:`publish` immediately afterward. With a positive exchange period,
+    :meth:`advance` also sets the environment's next step length so that the
+    step ends exactly on the next exchange. Commands are named, partial absolute
     positions; unspecified joints hold their last target (initially reset state).
     Invalid commands are rejected atomically with a warning, not an exception in
     the subscription callback. Optional velocity and effort arrays are validated
@@ -228,13 +235,39 @@ class Ros2Bridge:
             self._command_buffer[0, self._command_indices[name]] = value
         self._commands_dirty = True
 
+    @property
+    def exchange_due(self) -> bool:
+        """Whether the next :meth:`advance` exchanges commands (and the next :meth:`publish` publishes)."""
+        if not self._exchange_period_s or self._exchange_origin is None:
+            return True
+        return self._env.sim.physics_manager.get_simulation_time() >= self._next_deadline()
+
+    def _next_deadline(self) -> float:
+        return self._exchange_origin + self._next_exchange * self._exchange_period_s
+
+    def _end_step_at_next_exchange(self, elapsed: float) -> None:
+        """Step to the first physics step whose integrated time reaches the next deadline.
+
+        Backends add the physics dt once per physics step, so this repeats their sum and
+        lands on the step at which a one-physics-step loop would exchange. A deadline
+        beyond ``cfg.decimation`` physics steps is reached over several environment steps.
+        """
+        deadline = self._next_deadline()
+        dt = self._env.physics_dt
+        steps, time = 1, elapsed + dt
+        while steps < self._env.cfg.decimation and time < deadline:
+            time += dt
+            steps += 1
+        self._env.set_step_decimation(steps)
+
     def advance(self) -> torch.Tensor:
         """Process commands only when an exchange is due; otherwise return held targets."""
         if self._exchange_period_s:
             elapsed = self._env.sim.physics_manager.get_simulation_time()
             if self._exchange_origin is None:
                 self._exchange_origin = elapsed
-            elif elapsed < self._exchange_origin + self._next_exchange * self._exchange_period_s:
+            elif elapsed < self._next_deadline():
+                self._end_step_at_next_exchange(elapsed)
                 return self._actions
             else:
                 # Anchor to the initial publication, not the quantized physics grid.
@@ -244,6 +277,7 @@ class Ros2Bridge:
                     math.floor((elapsed - self._exchange_origin) / self._exchange_period_s) + 1,
                 )
             self._exchange_pending = True
+            self._end_step_at_next_exchange(elapsed)
         # Each hardware system can publish its own partial command. Drain all ready
         # callbacks so arm and gripper targets reach the same physics step, rather
         # than letting one spin_once per exchange accumulate a stale command queue.

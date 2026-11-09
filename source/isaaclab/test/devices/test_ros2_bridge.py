@@ -6,6 +6,7 @@
 """CPU contracts at the bridge boundary; no simulator or ROS installation required."""
 
 import copy
+import math
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -164,8 +165,11 @@ def bridge_model(monkeypatch):
         scene={"robot": asset},
         action_manager=SimpleNamespace(action=torch.zeros(1, 3), active_terms=list(terms), get_term=terms.__getitem__),
         sim=SimpleNamespace(steps=0, time=0.0),
+        physics_dt=0.0005,
+        step_decimations=[],
     )
     env.unwrapped = env
+    env.set_step_decimation = env.step_decimations.append
     env.sim.get_physics_step_count = lambda: env.sim.steps
     env.sim.get_physics_dt = lambda: 0.0005
     env.sim.physics_manager = SimpleNamespace(
@@ -398,6 +402,105 @@ def test_exchange_pause_resume_episode_reset_and_time_jump(bridge_env):
         assert len(bridge_env.node.published["/clock"]) == 4
     finally:
         bridge.close()
+
+
+def _single_physics_step_exchanges(origin_steps, total_steps, dt, period):
+    """Reference: step one physics step at a time and exchange whenever the anchored deadline is due."""
+    elapsed = 0.0
+    for _ in range(origin_steps):
+        elapsed += dt
+    origin, deadline_index, intakes, publications = elapsed, 1, [], []
+    for _ in range(origin_steps, total_steps):
+        due = elapsed >= origin + deadline_index * period
+        if due:
+            intakes.append(elapsed)
+            deadline_index = max(deadline_index + 1, math.floor((elapsed - origin) / period) + 1)
+        elapsed += dt  # backends add dt once per physics step
+        if due:
+            publications.append(elapsed)
+    return origin, intakes, publications
+
+
+@pytest.mark.parametrize(
+    ("dt", "period"), [(0.001, 1 / 150), (0.0005, 1 / 150), (0.001, 1 / 100), (0.001, 1 / 60), (0.001, 0.007)]
+)
+@pytest.mark.parametrize("origin_steps", [0, 1234])
+@pytest.mark.parametrize("max_steps", ["gap", 1, 4])
+def test_variable_steps_exchange_at_bit_identical_single_step_times(bridge_env, dt, period, origin_steps, max_steps):
+    """Ending each step on the next deadline reproduces one-physics-step exchanges bit for bit over 2 s."""
+    env = bridge_env.env
+    # The longest anchored gap, plus one physics step for a deadline that lands exactly on a step.
+    limit = math.floor(period / dt + 1e-9) + 1 if max_steps == "gap" else max_steps
+    env.cfg.decimation = limit
+    env.cfg.ros2_bridge.exchange_period_s = period
+    env.physics_dt = dt
+    total_steps = origin_steps + round(2.0 / dt)
+    origin, intakes, publications = _single_physics_step_exchanges(origin_steps, total_steps, dt, period)
+    for _ in range(origin_steps):
+        env.sim.time += dt
+    env.sim.steps = origin_steps
+    lengths = []
+
+    def set_step_decimation(steps):
+        assert 1 <= steps <= limit
+        env.step_length = steps
+
+    env.set_step_decimation = set_step_decimation
+    bridge = Ros2Bridge(env)
+    observed_intakes, intake_steps, observed_publications = [], [], []
+    try:
+        bridge.publish()  # anchors the schedule
+        assert bridge._exchange_origin == origin
+        while env.sim.steps < total_steps:
+            due, elapsed = bridge.exchange_due, env.sim.time
+            spins = bridge_env.node.spins
+            bridge.advance()
+            assert (bridge_env.node.spins > spins) == due  # ROS is drained exactly at exchanges
+            if due:
+                observed_intakes.append(elapsed)
+                intake_steps.append(env.sim.steps)
+            lengths.append(env.step_length)
+            for _ in range(env.step_length):
+                env.sim.time += dt
+            env.sim.steps += env.step_length
+            clocks = len(bridge_env.node.published["/clock"])
+            bridge.publish()
+            if len(bridge_env.node.published["/clock"]) > clocks:
+                observed_publications.append(env.sim.time)
+    finally:
+        bridge.close()
+    assert observed_intakes == intakes  # float64 equality, not approximate
+    assert len(intakes) >= math.floor(2.0 / period) - 1
+    assert len(observed_publications) == len(intakes)
+    if limit == 1:
+        assert observed_publications == publications
+    elif max_steps == "gap":
+        # One environment step per exchange; state is published at the next exchange.
+        assert len(lengths) == len(intakes) + 1
+        assert observed_publications[:-1] == intakes[1:]
+    assert all(round((elapsed - origin) / dt) == steps - origin_steps for elapsed, steps in zip(intakes, intake_steps))
+
+
+def test_150_hz_exchanges_on_one_ms_steps_alternate_seven_seven_six(bridge_env):
+    """Anchored 1/150 s deadlines first reach 1 ms steps 7, 14, 20, 27, 34, 40 (ceil, not round)."""
+    env = bridge_env.env
+    env.cfg.decimation, env.physics_dt = 7, 0.001
+    env.cfg.ros2_bridge.exchange_period_s = 1 / 150
+    _, intakes, _ = _single_physics_step_exchanges(0, 1000, 0.001, 1 / 150)
+    assert [round(elapsed / 0.001) for elapsed in intakes[:6]] == [7, 14, 20, 27, 34, 40]
+    lengths = []
+    env.set_step_decimation = lengths.append
+    bridge = Ros2Bridge(env)
+    try:
+        bridge.publish()
+        for _ in range(7):
+            bridge.advance()
+            for _ in range(lengths[-1]):
+                env.sim.time += 0.001
+            bridge.publish()
+    finally:
+        bridge.close()
+    assert lengths == [7, 7, 6, 7, 7, 6, 7]
 
 
 def test_default_zero_period_keeps_every_step_exchange_even_while_paused(bridge_env):

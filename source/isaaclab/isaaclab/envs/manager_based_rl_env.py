@@ -211,15 +211,18 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         is_rendering = self.sim.is_rendering
 
         # physics-owned decimation covers all substeps in one call
-        steps_per_call = self.cfg.decimation if self._physics_handles_decimation else 1
-        for _ in range(self.cfg.decimation // steps_per_call):
+        decimation = self._step_decimation
+        steps_per_call = decimation if self._physics_handles_decimation else 1
+        for _ in range(decimation // steps_per_call):
+            render_period = self._sim_step_counter // self.cfg.sim.render_interval
             self._sim_step_counter += steps_per_call
             self.action_manager.apply_action()
             self.scene.write_data_to_sim()
             self.sim.step(render=False)
             self.recorder_manager.record_post_physics_decimation_step()
+            # render once whenever this call crossed a render-interval boundary, for any step length
             # render_enabled=False skips Kit (camera/GUI); standalone visualizers still update
-            if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
+            if self._sim_step_counter // self.cfg.sim.render_interval > render_period and is_rendering:
                 self.sim.render(skip_app_pumping=not self.render_enabled)
             self.scene.update(dt=self.physics_dt * steps_per_call)
 

@@ -527,6 +527,8 @@ class NewtonManager(PhysicsManager):
     # CUDA graphing
     _graph = None
     _graph_capture_pending: bool = False
+    # Full-loop graphs by decimation, so alternating step lengths replay without recapture.
+    _graphs: dict[int, wp.Graph] = {}
 
     # Native scene-data publication.
     transforms_may_change_on_graph_replay: bool = False
@@ -607,6 +609,7 @@ class NewtonManager(PhysicsManager):
             # Release the cached collision pipeline, contacts and CUDA graph;
             # they point at the old model's freed buffers (CUDA 700 on next step).
             NewtonManager._graph = None
+            NewtonManager._graphs = {}
             NewtonManager._graph_capture_pending = False
             NewtonManager._collision_pipeline = None
             NewtonManager._contacts = None
@@ -742,7 +745,7 @@ class NewtonManager(PhysicsManager):
             else:
                 with wp.ScopedDevice(device):
                     cls._simulate_full()
-            PhysicsManager._sim_time += physics_dt * cls._decimation
+            physics_steps = cls._decimation
         else:
             # --- Some actuators not graph-safe: step them eagerly, graph solver only ---
             if cls._adapter is not None:
@@ -755,7 +758,12 @@ class NewtonManager(PhysicsManager):
             else:
                 with wp.ScopedDevice(device):
                     cls._simulate_physics_only()
-            PhysicsManager._sim_time += physics_dt
+            physics_steps = 1
+        # Add the configured dt once per physics step, as the PhysX backend does, so the
+        # clock is independent of how many physics steps one call folds together.
+        sim_dt = cls.get_physics_dt()
+        for _ in range(physics_steps):
+            PhysicsManager._sim_time += sim_dt
 
         # Run the requested step eagerly before capture so lazy GPU allocations happen outside recording.
         if cls._graph_capture_pending and cfg is not None and cfg.use_cuda_graph:
@@ -763,6 +771,8 @@ class NewtonManager(PhysicsManager):
             with Timer(name="newton_cuda_graph", msg="CUDA graph took:"):
                 NewtonManager._graph = cls._capture_graph(simulate)
             NewtonManager._graph_capture_pending = False
+            if cls._is_all_graphable():
+                NewtonManager._graphs[cls._decimation] = NewtonManager._graph
 
         cls._mark_transforms_changed()
 
@@ -841,6 +851,7 @@ class NewtonManager(PhysicsManager):
         NewtonManager._fk_reset_mask = None
         NewtonManager.kinematics_dirty = False
         NewtonManager._graph = None
+        NewtonManager._graphs = {}
         NewtonManager._graph_capture_pending = False
         NewtonManager.transforms_may_change_on_graph_replay = False
         NewtonManager._cable_bindings = {}
@@ -1639,7 +1650,13 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def _invalidate_graph(cls) -> None:
-        """Schedule capture after reset and decimation setup, without advancing physics."""
+        """Drop every captured graph and schedule capture, without advancing physics."""
+        NewtonManager._graphs = {}
+        cls._schedule_graph_capture()
+
+    @classmethod
+    def _schedule_graph_capture(cls) -> None:
+        """Capture the current loop after the next requested step runs eagerly."""
         NewtonManager._graph = None
         NewtonManager._graph_capture_pending = False
         cfg = PhysicsManager._cfg
@@ -1990,18 +2007,25 @@ class NewtonManager(PhysicsManager):
 
     @classmethod
     def set_decimation(cls, decimation: int) -> None:
-        """Set the decimation count and re-capture the CUDA graph.
+        """Set the decimation count and select its CUDA graph.
 
         When all actuators are graphable the entire decimation loop
         (actuators + solver substeps, repeated *decimation* times)
         is captured as a single CUDA graph.
 
-        Invalidate the existing graph when the loop changes. Its replacement is captured
-        immediately after the next requested step runs eagerly.
+        A loop length captured since the last reset replays its existing graph, so an
+        environment can alternate step lengths (e.g. to land on external exchange
+        deadlines) without recapturing. A new length is captured immediately after its
+        first requested step runs eagerly.
         """
         cls._decimation = max(1, decimation)
         if cls._is_all_graphable():
-            cls._invalidate_graph()
+            graph = NewtonManager._graphs.get(cls._decimation)
+            if graph is None:
+                cls._schedule_graph_capture()
+            else:
+                NewtonManager._graph = graph
+                NewtonManager._graph_capture_pending = False
 
     @classmethod
     def handles_decimation(cls) -> bool:

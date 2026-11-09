@@ -265,12 +265,19 @@ does not multiply it again or use wall-clock time.
 The host calls ``advance()`` before every ``env.step()`` and ``publish()`` afterward,
 as well as publishing once after the initial reset. Set ``exchange_period_s`` to a
 finite, nonnegative interval in seconds to limit ROS work without changing the
-environment's physics timestep or decimation. The default, zero, preserves an
-exchange on every environment step. With a positive period, the initial state is
-published immediately; subsequent command processing occurs at the first pre-step
-integrated-time sample meeting each deadline, followed by one post-step publication
-of joint state, TF and clock. Between exchanges, the same action tensor holds its
-targets, without polling ROS, gathering state or copying it to the CPU.
+environment's physics timestep. The default, zero, preserves an exchange on every
+environment step. With a positive period, the initial state is published immediately;
+subsequent command processing occurs at the first pre-step integrated-time sample
+meeting each deadline, followed by one post-step publication of joint state, TF and
+clock. ``advance()`` also ends each environment step on the first physics step whose
+integrated time reaches the next deadline, using
+:meth:`~isaaclab.envs.ManagerBasedEnv.set_step_decimation` with at most
+``cfg.decimation`` physics steps. Exchanges therefore occur on the same physics steps,
+at bit-identical integrated times, as with a decimation of one, without an environment
+step per physics step; with ``cfg.decimation`` at least the longest deadline interval,
+each environment step spans one exchange interval and its publication carries the
+next deadline's time. Between exchanges, the same action tensor holds its targets,
+without polling ROS, gathering state or copying it to the CPU.
 Ready callbacks update a persistent CPU command staging buffer. After the complete
 ready drain (including Jazzy's productive-readiness-pass retry), one blocking copy
 updates the device action tensor if any valid command arrived. Multiple partial
@@ -283,12 +290,13 @@ to the CPU once for joint-state and TF serialization. Buffers and their joint/po
 views are allocated once during construction, including on CPU-only environments.
 
 Deadlines are anchored to the initial publication time, not accumulated from the
-last exchange. For example, a period of ``1.0 / 150.0`` with 0.5 ms physics steps
-alternates 13- and 14-step intervals instead of rounding to a fixed step count.
-Starting at zero, the first command exchange is at 7 ms and its post-step
-publication at 7.5 ms. Thus publication can trail a deadline by up to two physics
-steps with this paired ordering; messages carry their actual integrated time,
-not the ideal deadline. Paused/stopped attempts perform no exchanges once the
+last exchange. For example, a period of ``1.0 / 150.0`` with 1 ms physics steps
+first reaches its deadlines on physics steps 7, 14, 20, 27, 34 and 40, alternating
+7, 7 and 6 physics steps instead of rounding to a fixed step count. With
+``cfg.decimation = 1``, the first command exchange is at 7 ms and its post-step
+publication at 8 ms; with ``cfg.decimation = 7``, that publication is at 14 ms, the
+next exchange. Messages carry their actual integrated time, not the ideal deadline.
+Paused/stopped attempts perform no exchanges once the
 initial state is published until integrated time meets the next deadline.
 Episode resets do not restart the cadence. A larger integration jump produces one
 exchange and skips missed deadlines, never a burst of stale publications.

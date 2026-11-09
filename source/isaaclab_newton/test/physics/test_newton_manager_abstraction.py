@@ -981,6 +981,50 @@ def test_cuda_graph_capture_uses_simulation_device(monkeypatch):
     assert graph is captured_graph
 
 
+def test_alternating_decimation_replays_cached_graphs_on_a_per_step_clock(monkeypatch):
+    """Alternating loop lengths capture once each and keep the clock of one physics step per call."""
+    dt = 0.001
+    eager, captured, launched = [], {}, []
+    monkeypatch.setattr(PhysicsManager, "_sim", SimpleNamespace(is_playing=lambda: True, cfg=SimpleNamespace(dt=dt)))
+    monkeypatch.setattr(PhysicsManager, "_cfg", SimpleNamespace(use_cuda_graph=True), raising=False)
+    monkeypatch.setattr(PhysicsManager, "_device", "cuda:0", raising=False)
+    monkeypatch.setattr(PhysicsManager, "_sim_time", 0.0)
+    monkeypatch.setattr(NewtonManager, "_model_changes", set())
+    monkeypatch.setattr(NewtonManager, "_graphs", {})
+    monkeypatch.setattr(NewtonManager, "_graph", None)
+    monkeypatch.setattr(NewtonManager, "_graph_capture_pending", False)
+    monkeypatch.setattr(NewtonManager, "_decimation", 1)
+    for name in ("forward", "_mark_transforms_changed", "_check_solver_status", "_log_solver_debug"):
+        monkeypatch.setattr(NewtonManager, name, classmethod(lambda cls: None))
+    monkeypatch.setattr(NewtonManager, "_is_all_graphable", classmethod(lambda cls: True))
+    monkeypatch.setattr(NewtonManager, "_simulate_full", classmethod(lambda cls: eager.append(cls._decimation)))
+
+    def capture(cls, _target):
+        graph = captured[cls._decimation] = object()
+        return graph
+
+    monkeypatch.setattr(NewtonManager, "_capture_graph", classmethod(capture))
+    monkeypatch.setattr(wp, "ScopedDevice", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(wp, "capture_launch", launched.append)
+
+    lengths = [7, 7, 6] * 4
+    for length in lengths:
+        NewtonManager.set_decimation(length)
+        NewtonManager.step()
+
+    # Each length runs eagerly and is captured once (calls 1 and 3); every later call replays its own graph.
+    assert eager == [7, 6] and set(captured) == {6, 7}
+    assert launched == [captured[length] for length in lengths[1:2] + lengths[3:]]
+    expected = 0.0
+    for _ in range(sum(lengths)):
+        expected += dt
+    assert PhysicsManager._sim_time == expected  # bit-identical to one call per physics step
+
+    NewtonManager._invalidate_graph()
+    assert NewtonManager._graphs == {} and NewtonManager._graph is None
+    assert NewtonManager._graph_capture_pending is True
+
+
 # ---------------------------------------------------------------------------
 # Manager state-refresh boundaries (no SimulationContext required)
 # ---------------------------------------------------------------------------
@@ -1557,8 +1601,11 @@ def test_graph_capture_preserves_first_step_and_recapture(monkeypatch, solver_cf
         NewtonManager.register_post_step_callback(lambda: wp.launch(_count_physics_steps, 1, inputs=[counter]))
         wrench = wp.array([[0.0, 0.0, 9.81, 0.0, 0.0, 0.0]], dtype=wp.spatial_vector, device="cuda:0")
         for step in range(3):
-            if step != 1:
+            if step == 0:
                 NewtonManager.set_decimation(1)
+            elif step == 2:
+                # set_decimation(1) would replay the cached graph; force a recapture.
+                NewtonManager._invalidate_graph()
             NewtonManager.get_state_0().body_f.assign(wrench)
             sim.step(render=False)
             assert NewtonManager._graph is not None
@@ -1619,7 +1666,8 @@ def test_stateful_actuator_graph_matches_eager_across_decimation_changes(monkeyp
             monkeypatch.setattr(sim, "_has_offscreen_render", True)
             NewtonManager.activate_newton_actuator_path()
             samples = []
-            for decimation in (1, 2, 3):
+            # Returning to 2 and 3 replays their cached graphs between switches.
+            for decimation in (1, 2, 3, 2, 3):
                 NewtonManager.set_decimation(decimation)
                 for target in (1.0, -2.0, 3.0, 0.0):
                     NewtonManager.get_control().joint_target_q.fill_(target)

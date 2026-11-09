@@ -204,6 +204,8 @@ class ManagerBasedEnv:
         # fold the full loop into a single step() when possible
         self.sim.physics_manager.set_decimation(self.cfg.decimation)
         self._physics_handles_decimation = self.sim.physics_manager.handles_decimation()
+        # physics steps run by each step() call; see set_step_decimation()
+        self._step_decimation = self.cfg.decimation
         # add timeline event to load managers
         report_activity("Setting up managers")
         self.load_managers()
@@ -515,6 +517,28 @@ class ManagerBasedEnv:
         # return observations
         return self.obs_buf, self.extras
 
+    def set_step_decimation(self, decimation: int) -> None:
+        """Set the number of physics steps that each following :meth:`step` call runs.
+
+        Lockstep co-simulation whose exchange deadlines are not a fixed multiple of the physics
+        step (for example a 150 Hz ROS 2 controller over a 1 ms physics step) can end each
+        environment step exactly on its next deadline instead of stepping one physics step at
+        a time. :attr:`ManagerBasedEnvCfg.decimation` remains the nominal :attr:`step_dt` and
+        the upper bound, so buffers sized per environment step stay valid. Backends that fold
+        the decimation loop into one captured call keep one capture per step length.
+
+        Args:
+            decimation: Physics steps per environment step, between 1 and ``cfg.decimation``.
+
+        Raises:
+            ValueError: If ``decimation`` is outside that range.
+        """
+        if not 1 <= decimation <= self.cfg.decimation:
+            raise ValueError(f"Step decimation {decimation} must be between 1 and {self.cfg.decimation}.")
+        if decimation != self._step_decimation:
+            self._step_decimation = decimation
+            self.sim.physics_manager.set_decimation(decimation)
+
     def step(self, action: torch.Tensor) -> tuple[VecEnvObs, dict]:
         """Execute one time-step of the environment's dynamics.
 
@@ -550,14 +574,17 @@ class ManagerBasedEnv:
         is_rendering = self.sim.is_rendering
 
         # physics-owned decimation covers all substeps in one call
-        steps_per_call = self.cfg.decimation if self._physics_handles_decimation else 1
-        for _ in range(self.cfg.decimation // steps_per_call):
+        decimation = self._step_decimation
+        steps_per_call = decimation if self._physics_handles_decimation else 1
+        for _ in range(decimation // steps_per_call):
+            render_period = self._sim_step_counter // self.cfg.sim.render_interval
             self._sim_step_counter += steps_per_call
             self.action_manager.apply_action()
             self.scene.write_data_to_sim()
             self.sim.step(render=False)
+            # render once whenever this call crossed a render-interval boundary, for any step length
             # render_enabled=False skips Kit (camera/GUI); standalone visualizers still update
-            if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
+            if self._sim_step_counter // self.cfg.sim.render_interval > render_period and is_rendering:
                 self.sim.render(skip_app_pumping=not self.render_enabled)
             self.scene.update(dt=self.physics_dt * steps_per_call)
 
