@@ -2988,6 +2988,12 @@ def test_heterogeneous_scene_per_view_shapes(sim, device, add_ground_plane, arti
     assert anymal_J.shape == torch.Size((num_per_type, anymal.num_bodies, 6, anymal_dofs)), (
         f"Anymal jacobian leaked model-wide shape: got {tuple(anymal_J.shape)}"
     )
+    # Native scratch is sized by each view's own articulation (Newton view layout), not by
+    # model.articulation_count x model-wide maxima, so it does not grow with other assets.
+    for asset in (franka, anymal):
+        scratch = asset.data._jacobian_buf_flat
+        assert tuple(scratch.shape) == asset.root_view.view_jacobian_shape(), tuple(scratch.shape)
+        assert scratch.shape[0] == num_per_type
 
     sim.step()
     franka.update(sim.cfg.dt)
