@@ -358,8 +358,8 @@ def _create_articulation_data_target(config, backend_manager):
         device=config.device,
     )
     mock_view.set_random_mock_data()
-    mock_view.eval_jacobian = lambda state, *, J, joint_S_s: None
-    mock_view.eval_mass_matrix = lambda state, *, H, J, body_I_s, joint_S_s: None
+    mock_view.eval_jacobian = lambda state, *, J, joint_S_s, view_layout: None
+    mock_view.eval_mass_matrix = lambda state, *, H, J, body_I_s, joint_S_s, view_layout: None
     mock_view.model = model
     data = data_type(mock_view, config.device, backend_manager=backend_manager)
     data._apply_ordering_maps_after_resolve()
