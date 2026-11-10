@@ -31,6 +31,7 @@ from isaaclab.cli import load_external_tasks
 from isaaclab.devices import DeviceCfg
 from isaaclab.devices.openxr import remove_camera_configs
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.envs.utils._manual_success import _prepare_success_term
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.string import string_to_callable
 from isaaclab.utils.version import has_kit
@@ -211,13 +212,21 @@ def main() -> None:  # noqa: C901
         if args_cli.disable_external_cameras:
             env_cfg = remove_camera_configs(env_cfg)
 
+    # Evaluate success manually, like record_demos.py and replay_demos.py: an automatic
+    # success reset inside env.step() would hide the successful state (e.g. an object
+    # released at the success instant) before it is ever rendered. The operator resets.
+    success_term = _prepare_success_term(env_cfg)
+
     with launch_simulation(env_cfg, args_cli), ExitStack() as cleanup:
-        run_teleoperation(env_cfg, teleop_cfg, cleanup)
+        run_teleoperation(env_cfg, teleop_cfg, cleanup, success_term)
 
 
-def run_teleoperation(
-    env_cfg: ManagerBasedRLEnvCfg, teleop_cfg: IsaacTeleopCfg | DeviceCfg, cleanup: ExitStack
-) -> None:  # noqa: C901
+def run_teleoperation(  # noqa: C901
+    env_cfg: ManagerBasedRLEnvCfg,
+    teleop_cfg: IsaacTeleopCfg | DeviceCfg,
+    cleanup: ExitStack,
+    success_term: DoneTerm | None = None,
+) -> None:
     """Create the environment and teleop device, then run the teleoperation loop until the app is closed."""
     from .. import XrCameraFeedSession, poll_control_events
 
@@ -256,8 +265,8 @@ def run_teleoperation(
                 " ignored."
             )
     except Exception as e:
-        logger.error(f"Failed to create environment: {e}")
-        return
+        logger.exception(f"Failed to create environment: {e}")
+        raise
 
     # Flags for controlling teleoperation flow
     should_reset_recording_instance = False
@@ -351,9 +360,17 @@ def run_teleoperation(
         # the device reads these from the focused visualizer window
         print("Isaac Capture control keys: [B] start/resume  [P] pause  [R] reset")
 
+    # Success is reported once per episode; only the operator's reset starts a new one.
+    success_func = None
+    if success_term is not None:
+        success_func = success_term.func
+        if isinstance(success_func, str):
+            success_func = string_to_callable(success_func)
+
     def run_loop():
         """Inner function to run the teleop loop with access to nonlocal variables."""
         nonlocal should_reset_recording_instance, teleoperation_active
+        success_reported = False
 
         # reset environment
         env.reset()
@@ -397,12 +414,20 @@ def run_teleoperation(
                         # render controller haptics from post-step contact forces
                         if haptic_driver is not None:
                             haptic_driver.update()
+                        if (
+                            success_func is not None
+                            and not success_reported
+                            and bool(success_func(env, **success_term.params).any())
+                        ):
+                            success_reported = True
+                            print("Success — press 'R' to reset the environment.")
 
                     if should_reset_recording_instance:
                         env.reset()
                         teleop_interface.reset()
                         camera_feed_session.refresh()
                         should_reset_recording_instance = False
+                        success_reported = False
                         print("Environment reset complete")
             except Exception as e:
                 logger.error(f"Error during simulation step: {e}")
