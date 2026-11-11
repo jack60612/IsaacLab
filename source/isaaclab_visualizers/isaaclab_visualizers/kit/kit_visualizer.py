@@ -177,9 +177,7 @@ class KitVisualizer(BaseVisualizer):
             not self.cfg.backend.enable_picking
             or self._runtime_headless
             or self.physics_backend != "newton"
-            or not sim.cfg.physics.solver_cfg.class_type.applies_body_forces(
-                sim.cfg.physics.solver_cfg, sim.backend_manager.backend.solver
-            )
+            or not sim.backend_manager.backend.solver_ops.applies_body_forces()
         ):
             return
         if self._newton_picking is None:

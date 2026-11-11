@@ -276,7 +276,9 @@ def test_newton_picking_masks_effective_viewport_partition(monkeypatch, visible,
     visualizer._env_ids = visible
     sim = MagicMock(stage=stage)
     sim.get_scene_data_provider.return_value.num_envs = 3
-    sim.cfg.physics.solver_cfg.class_type.applies_body_forces.return_value = True
+    # The redesigned Newton manager asks the live solver ops, not the solver cfg class.
+    sim.cfg.physics.solver_cfg = SimpleNamespace()
+    sim.backend_manager.backend.solver_ops = SimpleNamespace(applies_body_forces=lambda: True)
     visualizer._sim = sim
     monkeypatch.setattr(KitVisualizer, "physics_backend", property(lambda _: "newton"))
     constructor = MagicMock()
