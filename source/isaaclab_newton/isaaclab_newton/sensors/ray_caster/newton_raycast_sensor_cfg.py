@@ -27,5 +27,13 @@ class NewtonRaycastSensorCfg(RayCasterCfg):
 
     class_type: type[NewtonRaycastSensor] | str = "{DIR}.newton_raycast_sensor:NewtonRaycastSensor"
 
+    include_collision_shapes: bool = True
+    """Include non-visible collision shapes in the shared scene BVH.
+
+    The default preserves the Newton ray caster's collision-aware behavior. Set this to ``False`` for a sensor that
+    shares the camera's visible-only geometry. The BVH is shared, so another sensor requesting collision shapes still
+    adds them for every user of that BVH.
+    """
+
     mesh_prim_paths: list[str] = []
     """Unused. Rays hit every shape in the Newton scene BVH."""

@@ -177,6 +177,26 @@ def test_rays_hit_ground_plane(sim, generic_cfg):
         assert MultiMeshRayCasterCamera.resolve_class() is LegacyMultiMeshRayCasterCamera
 
 
+@pytest.mark.parametrize("sim", [pytest.param(False, id="eager")], indirect=True)
+def test_visible_only_raycast_keeps_the_shared_camera_bvh_visible_only(sim):
+    """Opting out of colliders must not alter the shared camera BVH or disable actual collision shapes."""
+    builder = sim.get_or_create_backend(NewtonBuilderCfg(physics_cfg=sim.cfg.physics))
+    scene_cfg = RaycastTestSceneCfg(num_envs=1)
+    scene_cfg.raycast.include_collision_shapes = False
+    scene = InteractiveScene(scene_cfg)
+    assert builder.default_bvh_cfg.shape_flags == ShapeFlags.VISIBLE
+    sim.reset()
+    sensor = _step_and_read(sim, scene)
+    assert sensor.cfg.include_collision_shapes is False
+    model = sensor.backend.model
+    assert model._bvh_shape_flags_mask == int(ShapeFlags.VISIBLE)
+    assert model.bvh_shape_enabled is not None
+    enabled = model.bvh_shape_enabled.numpy()[: model.bvh_shape_count_enabled]
+    flags = model.shape_flags.numpy()
+    assert all(flags[int(index)] & int(ShapeFlags.VISIBLE) for index in enabled)
+    assert any(flags[index] & int(ShapeFlags.COLLIDE_SHAPES) for index in range(model.shape_count))
+
+
 # The legacy adapter does not use the Newton manager graph.
 @pytest.mark.parametrize("sim", [pytest.param(False, id="eager")], indirect=True)
 def test_legacy_multi_mesh_tracks_ad_hoc_regex_target(sim):

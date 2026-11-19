@@ -247,8 +247,9 @@ class NewtonRaycastSensor(_NewtonRayCasterPoseMixin, BaseRayCaster):
         if cfg.max_distance <= 0.0:
             raise ValueError(f"max_distance must be positive, received {cfg.max_distance}.")
         super().__init__(cfg)
-        builder = self._sim.get_or_create_backend(NewtonBuilderCfg(physics_cfg=self._sim.cfg.physics))
-        builder.default_bvh_cfg.shape_flags |= newton.ShapeFlags.COLLIDE_SHAPES
+        if getattr(cfg, "include_collision_shapes", True):
+            builder = self._sim.get_or_create_backend(NewtonBuilderCfg(physics_cfg=self._sim.cfg.physics))
+            builder.default_bvh_cfg.shape_flags |= newton.ShapeFlags.COLLIDE_SHAPES
         self._data = NewtonRaycastSensorData()
         self._graph = None
 
