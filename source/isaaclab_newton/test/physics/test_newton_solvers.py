@@ -192,18 +192,17 @@ def recorded_mujoco_kwargs(monkeypatch) -> list[dict]:
     return constructed
 
 
-def test_mjwarp_determinism_disables_sensors_unless_a_sensor_needs_them(recorded_mujoco_kwargs):
-    """A guarantee builds MJWarp without its sensor stage, and refuses sensors that need that stage."""
+def test_mjwarp_determinism_disables_sensor_stage_but_allows_rne_observables(recorded_mujoco_kwargs):
+    """Body observables use Newton's independent post-constraint pass even with sensors disabled."""
     solver_cfg = MJWarpSolverCfg()
 
     MJWarpSolver(solver_cfg, _model_stub(), wp.DeterministicMode.NOT_GUARANTEED)
     MJWarpSolver(solver_cfg, _model_stub(), wp.DeterministicMode.RUN_TO_RUN)
     MJWarpSolver(solver_cfg, _model_stub({"body_qdd"}), wp.DeterministicMode.NOT_GUARANTEED)
-    for attr in ("body_qdd", "body_parent_f"):
-        with pytest.raises(ValueError, match="does not support deterministic physics"):
-            MJWarpSolver(solver_cfg, _model_stub({attr}), wp.DeterministicMode.RUN_TO_RUN)
+    MJWarpSolver(solver_cfg, _model_stub({"body_qdd"}), wp.DeterministicMode.RUN_TO_RUN)
+    MJWarpSolver(solver_cfg, _model_stub({"body_parent_f"}), wp.DeterministicMode.RUN_TO_RUN)
 
-    assert [kwargs["disable_sensors"] for kwargs in recorded_mujoco_kwargs] == [False, True, False]
+    assert [kwargs["disable_sensors"] for kwargs in recorded_mujoco_kwargs] == [False, True, False, True, True]
     assert solver_cfg.disable_sensors is False
 
 

@@ -23,8 +23,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SENSORS_BY_STATE_ATTRIBUTE = {"body_qdd": "the IMU or PVA sensor", "body_parent_f": "the joint-wrench sensor"}
-
 
 class MJWarpSolver(NewtonSolver):
     """Newton's MuJoCo Warp solver, which steps in place on one state."""
@@ -55,18 +53,13 @@ class MJWarpSolver(NewtonSolver):
         return None
 
     def build(self, model: Model, mode: wp.DeterministicMode, env_template: str | None) -> SolverMuJoCo:
-        """Construct MuJoCo Warp; a determinism guarantee disables its sensor stage, which cannot honor it."""
+        """Construct MuJoCo Warp with its general sensor stage disabled under determinism.
+
+        Newton requests ``run_rne_postconstraint`` independently when body
+        acceleration or parent wrench is needed. That pass remains active with
+        sensors disabled and honors MuJoCo Warp's deterministic mode.
+        """
         deterministic = mode != wp.DeterministicMode.NOT_GUARANTEED
-        blocked = set(model.get_requested_state_attributes()) & _SENSORS_BY_STATE_ATTRIBUTE.keys()
-        if deterministic and blocked:
-            sensors = sorted({_SENSORS_BY_STATE_ATTRIBUTE[attr] for attr in blocked})
-            raise ValueError(
-                f"This task does not support deterministic physics: it uses {' and '.join(sensors)},"
-                f" reading {sorted(blocked)}. Those attributes come from MuJoCo's post-constraint pass,"
-                " which runs inside the sensor stage that a determinism guarantee must disable, so the"
-                " values would never be refreshed. Remove the sensors, or drop the determinism request"
-                f" (deterministic_mode={mode.name})."
-            )
         kwargs = solver_kwargs(self.solver_class, self.cfg, mode)
         # ls_parallel is deprecated in newton; forwarding it (even as False) emits a warning.
         kwargs.pop("ls_parallel", None)
